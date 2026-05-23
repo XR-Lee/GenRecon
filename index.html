@@ -90,7 +90,7 @@
 
           <div class="column has-text-centered">
             <div class="publication-links">
-              <!-- PDF Link. -->
+              <!-- PDF Link. --><!-- TODO: 2x!!!!! -->
               <span class="link-block">
                 <a href=""
                    class="external-link button is-normal is-rounded is-dark">
@@ -109,7 +109,7 @@
                   <span>arXiv</span>
                 </a>
               </span>
-              <!-- Video Link. -->
+              <!-- Video Link. --> <!-- TODO -->
               <span class="link-block">
                 <a href=""
                    class="external-link button is-normal is-rounded is-dark">
@@ -139,21 +139,20 @@
   </div>
 </section>
 
-<!-- ==================== TEASER VIDEO ==================== -->
+<!-- ==================== TEASER 1 VIDEO ==================== -->
 <section class="hero teaser">
   <div class="container is-max-desktop">
     <div class="hero-body">
       <video id="teaser" autoplay muted loop playsinline height="100%">
-        <source src="./static/videos/teaser.mp4"
+        <source src="./static/videos/teaser_iphone.mp4"
                 type="video/mp4">
       </video>
       <h2 class="subtitle has-text-centered">
-        GenRecon fuses a 3D generative prior into multi-view reconstruction to reconstruct complete, editable 3D scene meshes from a sparse set of RGB images.
+        Given casually captured smartphone videos, GenRecon produces complete, PBR-ready mesh reconstructions of indoor environments.
       </h2>
     </div>
   </div>
 </section>
-
 
 <!-- ==================== ABSTRACT ==================== -->
 <section class="section">
@@ -174,14 +173,29 @@
       </div>
     </div>
 
-<!-- ==================== YOUTUBE VIDEO ==================== -->
+<!-- ==================== TEASER 2 VIDEO ==================== -->
+<section class="hero teaser">
+  <div class="container is-max-desktop">
+    <div class="hero-body">
+      <video id="teaser" autoplay muted loop playsinline height="100%">
+        <source src="./static/videos/teaser.mp4"
+                type="video/mp4">
+      </video>
+      <h2 class="subtitle has-text-centered">
+        GenRecon fuses a 3D generative prior into multi-view reconstruction to reconstruct complete, editable 3D scene meshes from a sparse set of RGB images.
+      </h2>
+    </div>
+  </div>
+</section>
+
+<!-- ==================== YOUTUBE VIDEO ==================== --> <!-- TODO -->
 <section class="section" style="padding-top: 0;">
   <div class="container is-max-desktop">
     <div class="columns is-centered has-text-centered">
       <div class="column is-four-fifths">
         <h2 class="title is-3">Video</h2>
         <div class="publication-video">
-          <iframe src="https://www.youtube.com/embed/zVnMHkFzHDg"
+          <iframe src=""
                   title="YouTube video player" frameborder="0"
                   allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
                   referrerpolicy="strict-origin-when-cross-origin" allowfullscreen>
@@ -240,8 +254,147 @@
         <video autoplay controls muted loop style="width: 100%; border-radius: 8px;">
           <source src="static/videos/relighting.mp4" type="video/mp4">
         </video>
-        <p class="is-size-6 has-text-grey" style="margin-top: 0.75rem;">
+        <p class="is-size-6 has-text-black" style="margin-top: 0.75rem;">
           Given a sparse set of RGB images, GenRecon reconstructs a high-fidelity PBR mesh enabling realistic relighting and editing in standard rendering pipelines.
+        </p>
+      </div>
+    </div>
+
+    <!-- Comparisons -->
+    <div class="columns is-centered has-text-centered" style="margin-top: 2rem;">
+      <div class="column is-four-fifths">
+        <h3 class="title is-4">Comparisons</h3>
+        <p class="is-size-6 has-text-grey" style="margin-bottom: 0.5rem;">
+          Drag the slider to compare each method (left) against ground truth (right).
+        </p>
+      </div>
+    </div>
+    <div class="columns is-multiline is-variable is-2">
+      <div class="column is-one-third">
+        <div id="cmp-ours" class="bal-container-small">
+          <div class="bal-wrapper">
+            <div class="bal-after">
+              <video autoplay muted loop playsinline><source src="static/videos/comparison/gt.mp4" type="video/mp4"></video>
+              <div class="bal-afterPosition afterLabel">GT</div>
+            </div>
+            <div class="bal-before">
+              <div class="bal-before-inset">
+                <video autoplay muted loop playsinline><source src="static/videos/comparison/ours.mp4" type="video/mp4"></video>
+                <div class="bal-beforePosition beforeLabel">Ours</div>
+              </div>
+            </div>
+            <div class="bal-handle">
+              <span class="handle-left-arrow"></span>
+              <span class="handle-right-arrow"></span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="column is-one-third">
+        <div id="cmp-2dgs" class="bal-container-small">
+          <div class="bal-wrapper">
+            <div class="bal-after">
+              <video autoplay muted loop playsinline><source src="static/videos/comparison/gt.mp4" type="video/mp4"></video>
+              <div class="bal-afterPosition afterLabel">GT</div>
+            </div>
+            <div class="bal-before">
+              <div class="bal-before-inset">
+                <video autoplay muted loop playsinline><source src="static/videos/comparison/2dgs.mp4" type="video/mp4"></video>
+                <div class="bal-beforePosition beforeLabel">2DGS</div>
+              </div>
+            </div>
+            <div class="bal-handle">
+              <span class="handle-left-arrow"></span>
+              <span class="handle-right-arrow"></span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="column is-one-third">
+        <div id="cmp-da3" class="bal-container-small">
+          <div class="bal-wrapper">
+            <div class="bal-after">
+              <video autoplay muted loop playsinline><source src="static/videos/comparison/gt.mp4" type="video/mp4"></video>
+              <div class="bal-afterPosition afterLabel">GT</div>
+            </div>
+            <div class="bal-before">
+              <div class="bal-before-inset">
+                <video autoplay muted loop playsinline><source src="static/videos/comparison/da3.mp4" type="video/mp4"></video>
+                <div class="bal-beforePosition beforeLabel">DA3</div>
+              </div>
+            </div>
+            <div class="bal-handle">
+              <span class="handle-left-arrow"></span>
+              <span class="handle-right-arrow"></span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="column is-one-third">
+        <div id="cmp-finerecon" class="bal-container-small">
+          <div class="bal-wrapper">
+            <div class="bal-after">
+              <video autoplay muted loop playsinline><source src="static/videos/comparison/gt.mp4" type="video/mp4"></video>
+              <div class="bal-afterPosition afterLabel">GT</div>
+            </div>
+            <div class="bal-before">
+              <div class="bal-before-inset">
+                <video autoplay muted loop playsinline><source src="static/videos/comparison/finerecon.mp4" type="video/mp4"></video>
+                <div class="bal-beforePosition beforeLabel">FineRecon</div>
+              </div>
+            </div>
+            <div class="bal-handle">
+              <span class="handle-left-arrow"></span>
+              <span class="handle-right-arrow"></span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="column is-one-third">
+        <div id="cmp-monosdf" class="bal-container-small">
+          <div class="bal-wrapper">
+            <div class="bal-after">
+              <video autoplay muted loop playsinline><source src="static/videos/comparison/gt.mp4" type="video/mp4"></video>
+              <div class="bal-afterPosition afterLabel">GT</div>
+            </div>
+            <div class="bal-before">
+              <div class="bal-before-inset">
+                <video autoplay muted loop playsinline><source src="static/videos/comparison/monosdf.mp4" type="video/mp4"></video>
+                <div class="bal-beforePosition beforeLabel">MonoSDF</div>
+              </div>
+            </div>
+            <div class="bal-handle">
+              <span class="handle-left-arrow"></span>
+              <span class="handle-right-arrow"></span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="column is-one-third">
+        <div id="cmp-murre" class="bal-container-small">
+          <div class="bal-wrapper">
+            <div class="bal-after">
+              <video autoplay muted loop playsinline><source src="static/videos/comparison/gt.mp4" type="video/mp4"></video>
+              <div class="bal-afterPosition afterLabel">GT</div>
+            </div>
+            <div class="bal-before">
+              <div class="bal-before-inset">
+                <video autoplay muted loop playsinline><source src="static/videos/comparison/murre.mp4" type="video/mp4"></video>
+                <div class="bal-beforePosition beforeLabel">MuRRe</div>
+              </div>
+            </div>
+            <div class="bal-handle">
+              <span class="handle-left-arrow"></span>
+              <span class="handle-right-arrow"></span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="columns is-centered has-text-centered">
+      <div class="column is-full-width">
+        <p class="is-size-6 has-text-black" style="margin-top: 0rem;">
+          While the baslines produce noisy or oversmooth surfaces for challenging areas and are incomplete in occluded and unobserved areas, our approach yields complete and high-fidelity reconstructions from 8 input images.
         </p>
       </div>
     </div>
@@ -272,7 +425,7 @@
   </div>
 </section>
 
-<!-- ==================== BIBTEX ==================== -->
+<!-- ==================== BIBTEX ==================== --> <!-- TODO -->
 <section class="section" id="BibTeX">
   <div class="container is-max-desktop content">
     <h2 class="title">BibTeX</h2>
@@ -289,10 +442,10 @@
 <footer class="footer">
   <div class="container">
     <div class="content has-text-centered">
-      <a class="icon-link"  href="https://arxiv.org/pdf/2603.26661">
+      <a class="icon-link"  href=""> <!-- TODO -->
         <i class="fas fa-file-pdf"></i>
       </a>
-      <a class="icon-link" href="https://github.com/nicolasvonluetzow/gaussiangpt">
+      <a class="icon-link" href="https://github.com/kasothaphie/GenRecon">
         <i class="fab fa-github"></i>
       </a>
     </div>
