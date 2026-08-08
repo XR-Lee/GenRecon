@@ -77,6 +77,14 @@ pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.
 ```
 </details>
 
+#### CuMesh reproducibility note
+
+The global GLB remesh uses the repository-owned
+`genrecon/vendor/cumesh_remeshing.py`, a memory-bounded derivative of CuMesh
+commit `12289e1062f0603f2f0d0771b02e1395d247f26f`. The setup script pins that
+revision because the vendored implementation calls its extension entry points.
+No manual edit under `site-packages` is required (or captured by `pip freeze`).
+
 ## 🗂️ Data
 
 We are grateful to the authors of the following datasets, whose data made this work
@@ -179,6 +187,42 @@ python reconstruct_scene.py \
   --pipeline_config configs/pipelines/texture.json \
   --proj_batch_voxels 2048
 ```
+
+For internet-video scenes that pass the native masked-COLMAP A gate, prepare
+undistorted RGBA plus a z-up, proxy-scaled native-SfM package with:
+
+```sh
+.venv/bin/python tools/prepare_native_sfm.py all
+```
+
+The three native-SfM scenes, their complete GenRecon PLY/PBR assets, and all 303
+registered-camera comparison frames are documented in
+`reports/NATIVE_SFM_GENRECON_REPORT_zh.md`. Review the videos at
+`outputs/internet-zero-shot/native-sfm-video-comparisons-v1/index.html`. These
+inputs retain native COLMAP point IDs, errors, and tracks; only scale and gravity
+are proxies.
+
+When masked COLMAP cannot provide a usable scene model, the research-only VGGT
+fallback can emit proxy-scaled, z-up pseudo geometry in the same `Iphone`
+layout:
+
+```sh
+PYTHONPATH=/tmp/pycolmap-wheel .venv/bin/python \
+  tools/prepare_foundation_sfm.py all
+```
+
+Review `data/internet-zero-shot/foundation-sfm-v1/index.html` before using any
+output. A GenRecon-consumable point cloud is not ground truth and can still
+represent a slideshow, a fixed-camera person shot, an outdoor scene, or more
+than one physical room. The public VGGT-1B checkpoint used by this tool is
+CC-BY-NC-4.0. See `reports/FOUNDATION_SFM_FALLBACK_REPORT_zh.md` for the fixed
+revisions, quality gates, and measured results. The 17-scene current-version
+GenRecon mesh/PBR asset run and its input-to-output directory map are documented
+in `reports/FOUNDATION_GENRECON_MESH_ASSETS_REPORT_zh.md`. Frame-exact original,
+reconstruction, and side-by-side H.264 review videos are documented in
+`reports/FOUNDATION_GENRECON_VIDEO_COMPARISON_REPORT_zh.md`; open
+`outputs/internet-zero-shot/foundation-video-comparisons-v1/index.html` to review
+all 17 candidates.
 
 ### GLB conversion
 Bake the reconstructed scene into a single textured `scene.glb`. This reads the

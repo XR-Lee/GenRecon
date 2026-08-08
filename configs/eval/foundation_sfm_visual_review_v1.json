@@ -1,0 +1,99 @@
+{
+  "schema": "genrecon.foundation-sfm-provisional-visual-review",
+  "schema_version": 1,
+  "reviewed_utc": "2026-08-07T18:48:00+00:00",
+  "reviewer_type": "AI-assisted contact-sheet and geometry-projection inspection",
+  "status": "provisional_requires_human_confirmation",
+  "summary": {
+    "proceed_foundation_pilot": 2,
+    "refine_then_retry": 5,
+    "reject_current_shot": 10
+  },
+  "candidates": [
+    {
+      "candidate_id": "raw-002-cologne-cathedral",
+      "disposition": "refine_then_retry",
+      "reason": "Continuous indoor cathedral views, but VGGT camera rotations disagree with the COLMAP fragment; retain as tall-room stress after a shorter coherent subset."
+    },
+    {
+      "candidate_id": "raw-003-castleton-house-tour",
+      "disposition": "reject_current_shot",
+      "reason": "Repeated exterior facade frames with effectively zero predicted baseline; not an indoor room reconstruction."
+    },
+    {
+      "candidate_id": "raw-004-blue-rose-ballroom",
+      "disposition": "reject_current_shot",
+      "reason": "Selected window is repeated title/slideshow content with effectively zero predicted baseline."
+    },
+    {
+      "candidate_id": "raw-005-beverly-theater",
+      "disposition": "reject_current_shot",
+      "reason": "Technically self-consistent but depicts an outdoor rooftop/patio rather than the requested indoor static room."
+    },
+    {
+      "candidate_id": "raw-006-evel-knievel-museum",
+      "disposition": "refine_then_retry",
+      "reason": "Indoor gift-shop/exhibit geometry is present, but a presenter and person-shaped displays dominate many views; derive a cleaner static-background subset."
+    },
+    {
+      "candidate_id": "raw-007-burlington-high-tech",
+      "disposition": "refine_then_retry",
+      "reason": "Window crosses kitchenette, corridor, and meeting room while people dominate later views; split by physical room."
+    },
+    {
+      "candidate_id": "raw-008-hilltop-school-arts",
+      "disposition": "refine_then_retry",
+      "reason": "Promising single auditorium, but camera rotation disagreement and one GenRecon closest-camera fallback require a shorter subset."
+    },
+    {
+      "candidate_id": "raw-009-wawasee-performing-arts",
+      "disposition": "proceed_foundation_pilot",
+      "reason": "Coherent service-window/kitchen area, P-A foundation geometry, 92,913 clean points, three chunks, and zero GenRecon fallback."
+    },
+    {
+      "candidate_id": "raw-011-lake-johanna-fire-station",
+      "disposition": "reject_current_shot",
+      "reason": "Dynamic ceremony/group scene with near-zero predicted viewpoint baseline."
+    },
+    {
+      "candidate_id": "raw-012-bartlett-bay-wastewater",
+      "disposition": "reject_current_shot",
+      "reason": "Outdoor presenter shot with near-zero predicted viewpoint baseline; not an indoor static room."
+    },
+    {
+      "candidate_id": "raw-013-lincoln-health-security",
+      "disposition": "reject_current_shot",
+      "reason": "Low-resolution title cards and institutional slides; not continuous camera observations of a room."
+    },
+    {
+      "candidate_id": "raw-014-unity-house",
+      "disposition": "proceed_foundation_pilot",
+      "reason": "Continuous single bunk bedroom, little dynamic content, P-B unanchored geometry, 96,099 clean points, seven chunks, and zero fallback; scale remains proxy."
+    },
+    {
+      "candidate_id": "raw-015-moses-myers-house",
+      "disposition": "reject_current_shot",
+      "reason": "Repeated slideshow/title-card sequence with near-zero predicted baseline."
+    },
+    {
+      "candidate_id": "raw-017-frederick-funeral-home",
+      "disposition": "reject_current_shot",
+      "reason": "Close-up poster/sign sequence rather than room coverage; foundation camera rotations disagree with the small COLMAP fragment."
+    },
+    {
+      "candidate_id": "raw-018-jabal-restaurant",
+      "disposition": "reject_current_shot",
+      "reason": "Near-fixed camera centered on a person eating, with high dynamic coverage; P-A self-consistency does not constitute room geometry."
+    },
+    {
+      "candidate_id": "raw-019-crockett-middle-school",
+      "disposition": "refine_then_retry",
+      "reason": "Window jumps from lobby/atrium to stage; split into one physical space before rerunning despite technically consumable P-B output."
+    },
+    {
+      "candidate_id": "raw-020-bethel-lutheran-home",
+      "disposition": "reject_current_shot",
+      "reason": "Person-dominated event shot with near-zero predicted viewpoint baseline."
+    }
+  ]
+}
