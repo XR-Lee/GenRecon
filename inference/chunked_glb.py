@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import gc
 import math
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Sequence
@@ -12,6 +14,41 @@ import numpy as np
 import o_voxel.postprocess as op
 import torch
 import trimesh
+
+from genrecon.vendor.cumesh_remeshing import remesh_narrow_band_dc
+
+
+def _release_cuda_memory() -> None:
+    """Release dead Python/CUDA allocations at an explicit pipeline boundary.
+
+    CuMesh and cuBVH allocate outside PyTorch's caching allocator, while O-Voxel
+    also creates large temporary PyTorch tensors.  Without an explicit collection
+    point, freed PyTorch blocks can stay reserved and starve a later CuMesh
+    ``cudaMalloc`` even though no live tensor needs those blocks anymore.
+    """
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+
+def _export_scene_atomic(scene: trimesh.Scene, destination: Path) -> None:
+    """Export a GLB cache entry atomically so interrupted writes are never resumed."""
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        prefix=f".{destination.stem}.",
+        suffix=destination.suffix,
+        dir=destination.parent,
+        delete=False,
+    ) as handle:
+        temporary = Path(handle.name)
+    try:
+        scene.export(str(temporary))
+        temporary.replace(destination)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _feature_locked_mask(vertices: torch.Tensor, faces: torch.Tensor, feature_angle_deg: float) -> torch.Tensor:
@@ -166,6 +203,80 @@ def _voxel_size_scalar(voxel_size: Any) -> float:
     return float(arr.max())
 
 
+def _project_back_in_batches(
+    vertices: torch.Tensor,
+    source_vertices: torch.Tensor,
+    source_faces: torch.Tensor,
+    bvh: Any,
+    amount: float,
+    *,
+    batch_size: int = 250_000,
+) -> torch.Tensor:
+    """Apply CuMesh's barycentric project-back without a scene-sized gather.
+
+    ``remesh_narrow_band_dc`` normally performs this operation before returning,
+    while all of its sparse-grid and topology temporaries are still alive.  At
+    scene scale, ``source_vertices[source_faces[face_id]]`` alone can require
+    hundreds of MiB.  Running the identical per-vertex expression after remesh
+    returns retires those temporaries, and batching bounds the gather size.
+    """
+
+    if amount <= 0 or vertices.shape[0] == 0:
+        return vertices
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}")
+
+    with torch.no_grad():
+        for start in range(0, vertices.shape[0], batch_size):
+            stop = min(start + batch_size, vertices.shape[0])
+            vertex_batch = vertices[start:stop]
+            distances, face_id, uvw = bvh.unsigned_distance(vertex_batch, return_uvw=True)
+            source_triangles = source_vertices[source_faces[face_id.long()]]
+            projected = (source_triangles * uvw.unsqueeze(-1)).sum(dim=1)
+            vertex_batch -= amount * (vertex_batch - projected)
+            del distances, face_id, uvw, source_triangles, projected, vertex_batch
+
+    return vertices
+
+
+def _assign_faces_to_nearest_chunk(
+    vertices: torch.Tensor,
+    faces: torch.Tensor,
+    chunk_centers: torch.Tensor,
+    *,
+    batch_size: int = 250_000,
+    verbose: bool = False,
+) -> torch.Tensor:
+    """Assign faces by centroid without materializing a scene-sized distance matrix."""
+
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}")
+    if chunk_centers.ndim != 2 or chunk_centers.shape[0] == 0 or chunk_centers.shape[1] != 3:
+        raise ValueError("chunk_centers must have shape (N, 3) with N > 0")
+
+    num_faces = faces.shape[0]
+    assignment = torch.empty(num_faces, dtype=torch.long, device=vertices.device)
+    num_batches = math.ceil(num_faces / batch_size) if num_faces else 0
+    progress_interval = max(1, num_batches // 10) if num_batches else 1
+
+    with torch.no_grad():
+        for batch_index, start in enumerate(range(0, num_faces, batch_size), start=1):
+            stop = min(start + batch_size, num_faces)
+            face_batch = faces[start:stop].long()
+            centroids = vertices[face_batch].mean(dim=1)
+            distances = torch.cdist(centroids, chunk_centers)
+            assignment[start:stop] = distances.argmin(dim=1)
+            del face_batch, centroids, distances
+
+            if verbose and (batch_index % progress_interval == 0 or batch_index == num_batches):
+                print(
+                    "[chunked_to_glb] face assignment batches "
+                    f"{batch_index}/{num_batches}"
+                )
+
+    return assignment
+
+
 def chunked_to_glb(
     vertices_world: torch.Tensor,
     faces: torch.Tensor,
@@ -209,8 +320,9 @@ def chunked_to_glb(
 
     vertices_world = vertices_world.to(device, dtype=torch.float32)
     faces = faces.to(device)
-    attr_volume = attr_volume.to(device)
-    coords = coords.to(device)
+    face_dtype = faces.dtype
+    # Attribute tensors are unused during the memory-heavy global remesh.  Keep
+    # them on their input device (CPU for the resumable CLI) until chunk baking.
     chunk_centers_world = chunk_centers_world.to(device, dtype=torch.float32)
 
     aabb_t = _to_tensor(aabb_world, device)
@@ -232,6 +344,10 @@ def chunked_to_glb(
                 f"{pre_mesh.num_vertices:,} verts, {pre_mesh.num_faces:,} faces"
             )
         pre_v, pre_f = pre_mesh.read()
+        # CuMesh now owns the filled generation; the original CUDA inputs are
+        # no longer needed during remeshing or projection.
+        del vertices_world, faces
+        _release_cuda_memory()
     else:
         if verbose:
             print("[chunked_to_glb] skipping fill_holes")
@@ -252,17 +368,51 @@ def chunked_to_glb(
         center = aabb_t.mean(dim=0)
         scale = float((aabb_t[1] - aabb_t[0]).max().item())
 
-        new_v, new_f = cumesh.remeshing.remesh_narrow_band_dc(
+        # Use the repository-owned, memory-bounded derivative of the pinned
+        # CuMesh implementation.  This must not depend on a hand-edited copy in
+        # site-packages; fresh environments need the same scene-scale behavior.
+        new_v, new_f = remesh_narrow_band_dc(
             pre_v,
             pre_f,
             center=center,
             scale=(remesh_res + 3 * remesh_band) / remesh_res * scale,
             resolution=remesh_res,
             band=remesh_band,
-            project_back=remesh_project,
+            # Project after this function returns so its sparse-grid/topology
+            # temporaries are gone, then use bounded barycentric gathers.
+            project_back=0.0,
             verbose=verbose,
             bvh=bvh,
         )
+
+        _release_cuda_memory()
+        if remesh_project > 0:
+            if verbose:
+                print(
+                    "[chunked_to_glb] projecting remesh back to source "
+                    "in 250,000-vertex batches"
+                )
+            new_v = _project_back_in_batches(
+                new_v,
+                pre_v,
+                pre_f,
+                bvh,
+                remesh_project,
+            )
+
+        # ``new_v``/``new_f`` own the remesh result.  Retire every input-side
+        # allocation before constructing the output CuMesh: at scene scale the
+        # old fill-hole mesh + BVH + source tensors and the new mesh cannot all
+        # coexist within 16 GiB, even though either generation fits by itself.
+        del bvh, center
+        if do_fill_holes:
+            pre_mesh.clear_cache()
+            del pre_mesh
+        del pre_v, pre_f
+        if not do_fill_holes:
+            del vertices_world, faces
+        _release_cuda_memory()
+
         mesh = cumesh.CuMesh()
         mesh.init(new_v, new_f)
         if verbose:
@@ -270,10 +420,22 @@ def chunked_to_glb(
         # DC remesh produces a clean manifold; o_voxel.to_glb's remesh branch also skips
         # post-remesh cleanup. Per-chunk to_glb(remesh=False) will run its own local cleanup.
         gv, gf = mesh.read()
+        mesh.clear_cache()
+        del mesh, new_v, new_f
+        _release_cuda_memory()
     else:
         if verbose:
             print("[chunked_to_glb] skipping remesh")
         gv, gf = pre_v, pre_f
+        # With remeshing disabled, ``gv``/``gf`` keep the selected generation
+        # alive while the redundant owners and aliases can be discarded.
+        if do_fill_holes:
+            pre_mesh.clear_cache()
+            del pre_mesh
+            del pre_v, pre_f
+        else:
+            del pre_v, pre_f, vertices_world, faces
+        _release_cuda_memory()
 
     elapsed_remesh = time.perf_counter() - t0
     if verbose:
@@ -308,12 +470,22 @@ def chunked_to_glb(
             print(f"[chunked_to_glb] dumped {global_path} " f"({gv.shape[0]:,} verts, {gf.shape[0]:,} faces)")
 
     # ── Step 2: Spatial partition by face centroid (nearest chunk center) ─
-    centroids = gv[gf.long()].mean(dim=1)  # (F, 3)
-    dists = torch.cdist(centroids.unsqueeze(0), chunk_centers_world.unsqueeze(0)).squeeze(0)
-    assignment = dists.argmin(dim=1)  # (F,) → index into chunk_indices
+    assignment = _assign_faces_to_nearest_chunk(
+        gv,
+        gf,
+        chunk_centers_world,
+        verbose=verbose,
+    )  # (F,) → index into chunk_indices
     if verbose:
         for k, idx in enumerate(chunk_indices):
             print(f"[chunked_to_glb] chunk {idx:03d}: {(assignment == k).sum().item():,} faces")
+    # Retire temporary allocator blocks from the bounded assignment batches
+    # before moving the attribute volumes onto the GPU.
+    _release_cuda_memory()
+
+    # These tensors are first consumed by O-Voxel's per-chunk texture bake.
+    attr_volume = attr_volume.to(device)
+    coords = coords.to(device)
 
     # ── Step 3 + 4: Per-chunk bake + combine into trimesh.Scene ─────────
     scene = trimesh.Scene()
@@ -336,6 +508,8 @@ def chunked_to_glb(
         if n_chunk_faces == 0:
             if verbose:
                 print(f"[chunked_to_glb] chunk {chunk_idx:03d}: empty, skipping")
+            del face_mask
+            _release_cuda_memory()
             continue
 
         # Resume: if a per-chunk GLB exists from a prior run, load it and skip bake.
@@ -345,6 +519,8 @@ def chunked_to_glb(
                 print(f"[chunked_to_glb] chunk {chunk_idx:03d}: resume from {chunk_path}")
             try:
                 _add_loaded_to_scene(trimesh.load(str(chunk_path), force="scene"), chunk_idx)
+                del face_mask
+                _release_cuda_memory()
                 continue
             except Exception as e:
                 print(f"[chunked_to_glb] chunk {chunk_idx:03d}: WARN failed to load cached GLB ({e}); re-baking")
@@ -354,7 +530,12 @@ def chunked_to_glb(
         remap = torch.full((n_verts,), -1, dtype=torch.long, device=gv.device)
         remap[used_v_ids] = torch.arange(used_v_ids.shape[0], device=gv.device)
         chunk_v = gv[used_v_ids].contiguous()
-        chunk_f = remap[chunk_faces_global].to(faces.dtype).contiguous()
+        chunk_f = remap[chunk_faces_global].to(face_dtype).contiguous()
+
+        # Only compact chunk geometry is required by O-Voxel.  Drop the global
+        # remap and selection temporaries before its CuMesh/BVH allocations.
+        del face_mask, chunk_faces_global, used_v_ids, remap
+        _release_cuda_memory()
 
         # Dump-only path: write the per-chunk pre-bake mesh and skip op.to_glb.
         if dump_geometry_dir is not None:
@@ -368,6 +549,8 @@ def chunked_to_glb(
                 print(
                     f"[chunked_to_glb] dumped {chunk_path} " f"({chunk_v.shape[0]:,} verts, {chunk_f.shape[0]:,} faces)"
                 )
+            del chunk_v, chunk_f
+            _release_cuda_memory()
             continue
 
         if n_chunk_faces > simplify_threshold:
@@ -405,12 +588,14 @@ def chunked_to_glb(
         if chunk_path is not None:
             try:
                 export_obj = chunk_glb if isinstance(chunk_glb, trimesh.Scene) else trimesh.Scene([chunk_glb])
-                export_obj.export(str(chunk_path))
+                _export_scene_atomic(export_obj, chunk_path)
                 if verbose:
                     print(f"[chunked_to_glb] chunk {chunk_idx:03d}: saved {chunk_path}")
             except Exception as e:
                 print(f"[chunked_to_glb] chunk {chunk_idx:03d}: WARN failed to save {chunk_path}: {e}")
 
         scene.add_geometry(chunk_glb, geom_name=f"chunk_{chunk_idx:03d}")
+        del chunk_glb, chunk_v, chunk_f
+        _release_cuda_memory()
 
     return scene

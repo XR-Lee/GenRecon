@@ -14,7 +14,7 @@ Joint frame convention:
     where ``rel_t`` is the chunker's ``relative_translation`` (unit =
     ``chunk_size``).
 
-Chunked decode (1024 pipeline only):
+Chunked decode (1024, or very large low-VRAM 512 scenes):
   * For ``len(slats) > max_chunks_per_group``, chunks are spatially grouped
     via recursive longest-axis bisection until each leaf has
     ``≤ max_chunks_per_group`` chunks.
@@ -117,7 +117,7 @@ def _make_groups(
     joint_slat: Optional[SparseTensor] = None,
     overlap_r_in: int = 16,
     max_inflated_voxels: Optional[int] = None,
-) -> Tuple[List[List[int]], List[int]]:
+) -> Tuple[List[List[int]], List[int], List[torch.Tensor]]:
     """Recursive longest-axis median bisection over chunk centers.
 
     A leaf is accepted only if BOTH:
@@ -125,62 +125,83 @@ def _make_groups(
       - the inflated AABB of the leaf contains ``<= max_inflated_voxels``
         voxels in ``joint_slat`` (when both are provided).
 
-    The inflated count is the *actual* number of voxels the per-group decoder
-    forward will consume (after merge dedup, including overlap from
-    neighboring chunks) — it is the direct memory governor at res=1024, not
-    the pre-merge owned voxel sum. Single-chunk leaves are returned even if
-    they exceed the cap (cannot bisect further).
+    Each recursive split also bisects the parent's owned AABB halfway between
+    the two adjacent chunk-center sets. The resulting leaf AABBs are disjoint
+    and cover the full joint lattice; only their decoder inputs overlap. This
+    prevents the input chunks' intentional overlap from duplicating output
+    faces at group boundaries.
 
-    Returns ``(groups, group_inflated_counts)``. The counts are zero when no
-    measurement was performed (joint_slat or max_inflated_voxels missing).
+    The inflated count is the actual number of merged voxels the per-group
+    forward consumes. Single-chunk leaves are returned even if they exceed the
+    cap because they cannot be bisected further.
+
+    Returns ``(groups, group_inflated_counts, owned_aabbs)``. Counts are zero
+    when no measurement was requested.
     """
-    centers = torch.stack([t.float() * R_in + R_in / 2 for t in relative_transl])
+    device = joint_slat.feats.device if joint_slat is not None else relative_transl[0].device
+    offsets = torch.stack([(t.to(device) * R_in).round().long() for t in relative_transl])
+    mins_global = offsets.min(dim=0).values
+    origins = offsets - mins_global
+    centers = origins.float() + R_in / 2
+    root_owned = torch.stack(
+        [
+            torch.zeros(3, dtype=torch.long, device=device),
+            origins.max(dim=0).values + R_in,
+        ]
+    )
 
     do_measure = joint_slat is not None and max_inflated_voxels is not None
     if do_measure:
-        device = joint_slat.feats.device
-        offsets = torch.stack([(t.to(device) * R_in).round().long() for t in relative_transl])
-        mins_global = offsets.min(dim=0).values
-        offsets_minus_mins = offsets - mins_global  # [K, 3]
         coords_xyz = joint_slat.coords[:, 1:]
 
-        def inflated_count(indices: List[int]) -> int:
-            chunk_origins = offsets_minus_mins[torch.tensor(indices, device=device)]
-            owned_min = chunk_origins.min(dim=0).values
-            owned_max = chunk_origins.max(dim=0).values + R_in
-            inf_min = (owned_min - overlap_r_in).to(coords_xyz.dtype)
-            inf_max = (owned_max + overlap_r_in).to(coords_xyz.dtype)
+        def inflated_count(owned: torch.Tensor) -> int:
+            inf_min = (owned[0] - overlap_r_in).to(coords_xyz.dtype)
+            inf_max = (owned[1] + overlap_r_in).to(coords_xyz.dtype)
             mask = ((coords_xyz >= inf_min) & (coords_xyz < inf_max)).all(dim=1)
             return int(mask.sum().item())
 
     else:
 
-        def inflated_count(indices: List[int]) -> int:  # pragma: no cover
+        def inflated_count(owned: torch.Tensor) -> int:  # pragma: no cover
             return 0
 
-    def is_leaf(indices: List[int]) -> bool:
+    def is_leaf(indices: List[int], owned: torch.Tensor) -> bool:
         if len(indices) <= 1:
             return True  # cannot bisect further
         if len(indices) > max_chunks_per_group:
             return False
-        if do_measure and inflated_count(indices) > max_inflated_voxels:
+        if do_measure and inflated_count(owned) > max_inflated_voxels:
             return False
         return True
 
-    def bisect(indices: List[int]) -> List[List[int]]:
-        if is_leaf(indices):
-            return [indices]
-        sub = centers[torch.tensor(indices)]
+    def bisect(indices: List[int], owned: torch.Tensor) -> List[Tuple[List[int], torch.Tensor]]:
+        if is_leaf(indices, owned):
+            return [(indices, owned)]
+        index_tensor = torch.tensor(indices, device=device)
+        sub = centers[index_tensor]
         ranges = sub.max(dim=0).values - sub.min(dim=0).values
         axis = int(ranges.argmax().item())
         order = torch.argsort(sub[:, axis]).tolist()
         sorted_indices = [indices[i] for i in order]
         mid = len(sorted_indices) // 2
-        return bisect(sorted_indices[:mid]) + bisect(sorted_indices[mid:])
+        left_indices = sorted_indices[:mid]
+        right_indices = sorted_indices[mid:]
+        left_max = centers[torch.tensor(left_indices, device=device), axis].max()
+        right_min = centers[torch.tensor(right_indices, device=device), axis].min()
+        split = int(torch.round((left_max + right_min) * 0.5).item())
+        split = max(int(owned[0, axis].item()) + 1, min(split, int(owned[1, axis].item()) - 1))
 
-    groups = bisect(list(range(len(relative_transl))))
-    counts = [inflated_count(g) for g in groups] if do_measure else [0] * len(groups)
-    return groups, counts
+        left_owned = owned.clone()
+        right_owned = owned.clone()
+        left_owned[1, axis] = split
+        right_owned[0, axis] = split
+        return bisect(left_indices, left_owned) + bisect(right_indices, right_owned)
+
+    leaves = bisect(list(range(len(relative_transl))), root_owned)
+    groups = [indices for indices, _ in leaves]
+    owned_aabbs = [owned for _, owned in leaves]
+    counts = [inflated_count(owned) for owned in owned_aabbs] if do_measure else [0] * len(groups)
+    return groups, counts, owned_aabbs
 
 
 def _filter_sparse_to_aabb(
@@ -199,16 +220,6 @@ def _filter_sparse_to_aabb(
         feats=st.feats[mask].contiguous(),
         coords=coords[mask].contiguous(),
     )
-
-
-def _group_owned_aabb(
-    group_chunk_idx: List[int],
-    offsets_minus_mins: List[torch.Tensor],
-    R_in: int,
-) -> torch.Tensor:
-    """Owned AABB ``[2, 3]`` at R_in scale in joint-frame integer coords."""
-    origins = torch.stack([offsets_minus_mins[i] for i in group_chunk_idx])
-    return torch.stack([origins.min(dim=0).values, origins.max(dim=0).values + R_in])
 
 
 def _concat_sparse(parts: List[SparseTensor]) -> SparseTensor:
@@ -232,6 +243,11 @@ def _sparse_cpu_clean(st: SparseTensor) -> SparseTensor:
     return SparseTensor(feats=st.feats.cpu(), coords=st.coords.cpu())
 
 
+def _sparse_clean(st: SparseTensor) -> SparseTensor:
+    """Drop backend caches while preserving payload and device."""
+    return SparseTensor(feats=st.feats, coords=st.coords)
+
+
 def _sparse_to_device_clean(st: SparseTensor, device: torch.device) -> SparseTensor:
     """Restore a CPU-stashed SparseTensor to ``device`` via fresh constructor."""
     return SparseTensor(
@@ -249,6 +265,7 @@ def joint_decode_shape(
     max_chunks_per_group: Optional[int] = None,
     max_inflated_voxels: Optional[int] = None,
     overlap_r_in: int = 16,
+    consume_inputs: bool = False,
 ) -> Tuple[Mesh, torch.Tensor, torch.Tensor, JointDecodeContext, Dict]:
     """Joint shape decode + joint mesh extraction.
 
@@ -268,10 +285,17 @@ def joint_decode_shape(
     R_in = decoder.resolution // (2**num_up)
     upscale = decoder.resolution // R_in
 
+    num_slats = len(slats)
     joint_slat, meta = _merge_chunk_slats(slats, relative_transl, R_in)
+    if consume_inputs:
+        # The merged tensor owns its feature/coordinate storage. Releasing the
+        # per-chunk inputs here avoids keeping both representations resident
+        # throughout the much larger decoder forward.
+        slats.clear()
+        torch.cuda.empty_cache()
     device = joint_slat.feats.device
 
-    chunk_cap_active = max_chunks_per_group is not None and len(slats) > max_chunks_per_group
+    chunk_cap_active = max_chunks_per_group is not None and num_slats > max_chunks_per_group
     voxel_cap_active = max_inflated_voxels is not None and int(joint_slat.coords.shape[0]) > max_inflated_voxels
     use_chunked = chunk_cap_active or voxel_cap_active
 
@@ -291,6 +315,16 @@ def joint_decode_shape(
     if not use_chunked:
         # Single-pass: original behavior. Decode → channel-extract → mesh-extract once.
         h_joint, joint_subs = SparseUnetVaeDecoder.forward(decoder, joint_slat, return_subs=True)
+        h_joint_clean = _sparse_clean(h_joint)
+        joint_subs_cpu = [_sparse_cpu_clean(sub) for sub in joint_subs]
+        del h_joint, joint_subs, joint_slat
+        h_joint = h_joint_clean
+        if getattr(decoder, "low_vram", False):
+            # The decoder is no longer used after its forward. Keeping its
+            # weights on-device during dual-grid extraction adds about 0.9 GiB
+            # to the shape peak on the 512 checkpoint.
+            decoder.cpu()
+        torch.cuda.empty_cache()
         vertices = h_joint.replace((1 + 2 * vm) * F.sigmoid(h_joint.feats[..., 0:3]) - vm)
         intersected = h_joint.replace(h_joint.feats[..., 3:6] > 0)
         quad_lerp = h_joint.replace(F.softplus(h_joint.feats[..., 6:7]))
@@ -313,7 +347,7 @@ def joint_decode_shape(
         ctx = JointDecodeContext(
             inflated_aabbs=None,
             owned_aabbs=None,
-            subs_inflated=[joint_subs],
+            subs_inflated=[joint_subs_cpu],
             R_in=R_in,
             upscale=upscale,
         )
@@ -329,12 +363,8 @@ def joint_decode_shape(
     # are spatially disjoint by construction). Boundary mesh vertices appear
     # in multiple groups' inflated extracts; we dedupe by voxel coord at the
     # end so the final mesh shares vertices across group boundaries.
-    offsets = [(t.to(device) * R_in).round().long() for t in relative_transl]
-    mins = torch.stack(offsets).min(dim=0).values
-    offsets_minus_mins = [(o - mins) for o in offsets]
-
-    chunk_cap = max_chunks_per_group if max_chunks_per_group is not None else len(slats)
-    groups, group_inflated_counts = _make_groups(
+    chunk_cap = max_chunks_per_group if max_chunks_per_group is not None else num_slats
+    groups, group_inflated_counts, group_owned_aabbs = _make_groups(
         relative_transl,
         R_in,
         chunk_cap,
@@ -343,7 +373,7 @@ def joint_decode_shape(
         max_inflated_voxels=max_inflated_voxels,
     )
     print(
-        f"[joint_decode_shape] chunked: {len(slats)} chunks → {len(groups)} groups "
+        f"[joint_decode_shape] chunked: {num_slats} chunks → {len(groups)} groups "
         f"(sizes: {[len(g) for g in groups]}, inflated-voxel counts: {group_inflated_counts})"
     )
 
@@ -354,13 +384,17 @@ def joint_decode_shape(
     owned_aabbs: List[torch.Tensor] = []
     subs_inflated_per_group: List[List[SparseTensor]] = []
 
-    for g_idx, group in enumerate(groups):
-        owned_aabb = _group_owned_aabb(group, offsets_minus_mins, R_in)
+    for g_idx, (group, owned_aabb) in enumerate(zip(groups, group_owned_aabbs)):
         inflated_aabb = torch.stack([owned_aabb[0] - overlap_r_in, owned_aabb[1] + overlap_r_in])
 
         slat_g = _filter_sparse_to_aabb(joint_slat, inflated_aabb[0], inflated_aabb[1])
         n_in = slat_g.feats.shape[0]
         h_g, subs_g = SparseUnetVaeDecoder.forward(decoder, slat_g, return_subs=True)
+        h_g_clean = _sparse_clean(h_g)
+        subs_g_cpu = [_sparse_cpu_clean(s) for s in subs_g]
+        del h_g, subs_g
+        h_g = h_g_clean
+        torch.cuda.empty_cache()
 
         # Channel extraction on the inflated h_g (small enough per-group).
         v_g = h_g.replace((1 + 2 * vm) * F.sigmoid(h_g.feats[..., 0:3]) - vm)
@@ -404,16 +438,20 @@ def joint_decode_shape(
 
         inflated_aabbs.append(inflated_aabb)
         owned_aabbs.append(owned_aabb)
-        subs_inflated_per_group.append([_sparse_cpu_clean(s) for s in subs_g])
+        subs_inflated_per_group.append(subs_g_cpu)
 
         print(
             f"[joint_decode_shape] group {g_idx}: chunks={group} in={n_in:,} → "
             f"verts={mesh_v_compact.shape[0]:,}, faces={mesh_f_compact.shape[0]:,}"
         )
 
-        del slat_g, h_g, subs_g, v_g, i_g, q_g, coords_g
+        del slat_g, h_g, v_g, i_g, q_g, coords_g
         del mesh_v_g, mesh_f_g, mesh_f_owned, used_v, remap
         del mesh_v_compact, mesh_f_compact, voxel_coords_compact, face_centroids, in_owned
+        torch.cuda.empty_cache()
+
+    if getattr(decoder, "low_vram", False):
+        decoder.cpu()
         torch.cuda.empty_cache()
 
     # ── Concat per-group meshes + dedupe boundary vertices ────────────────
@@ -473,6 +511,8 @@ def joint_decode_tex(
     slats: List[SparseTensor],
     ctx: JointDecodeContext,
     relative_transl: List[torch.Tensor],
+    *,
+    consume_inputs: bool = False,
 ) -> SparseTensor:
     """Joint tex decode. Returns a single joint-frame ``SparseTensor`` in
     ``[0, 1]`` covering the whole scene.
@@ -483,11 +523,18 @@ def joint_decode_tex(
     subdivision tensors and is filtered to its owned region before concat.
     """
     joint_slat, _ = _merge_chunk_slats(slats, relative_transl, ctx.R_in)
+    if consume_inputs:
+        slats.clear()
+        torch.cuda.empty_cache()
 
     if ctx.inflated_aabbs is None:
         # Single-pass: original behavior.
-        h_joint = decoder(joint_slat, guide_subs=ctx.subs_inflated[0])
-        return h_joint * 0.5 + 0.5
+        device = joint_slat.feats.device
+        guide_subs = [_sparse_to_device_clean(sub, device) for sub in ctx.subs_inflated[0]]
+        ctx.subs_inflated[0].clear()
+        h_joint = decoder(joint_slat, guide_subs=guide_subs)
+        scaled = h_joint * 0.5 + 0.5
+        return SparseTensor(feats=scaled.feats, coords=scaled.coords)
 
     # Chunked path: per-group decode with own subs, merge owned outputs.
     # subs were CPU-stashed in joint_decode_shape; lift back to GPU per group.
@@ -496,6 +543,7 @@ def joint_decode_tex(
     for g_idx, (inflated, owned, subs_g_cpu) in enumerate(zip(ctx.inflated_aabbs, ctx.owned_aabbs, ctx.subs_inflated)):
         tex_slat_g = _filter_sparse_to_aabb(joint_slat, inflated[0], inflated[1])
         subs_g = [_sparse_to_device_clean(s, device) for s in subs_g_cpu]
+        subs_g_cpu.clear()
         n_in = tex_slat_g.feats.shape[0]
         h_g = decoder(tex_slat_g, guide_subs=subs_g)
         h_g_owned = _filter_sparse_to_aabb(h_g, owned[0] * ctx.upscale, owned[1] * ctx.upscale)
@@ -506,4 +554,5 @@ def joint_decode_tex(
         torch.cuda.empty_cache()
 
     h_joint = _concat_sparse([_sparse_to_device_clean(p, device) for p in h_owned_parts])
-    return h_joint * 0.5 + 0.5
+    scaled = h_joint * 0.5 + 0.5
+    return SparseTensor(feats=scaled.feats, coords=scaled.coords)

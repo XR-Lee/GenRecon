@@ -14,6 +14,11 @@ NVDIFFRAST=false
 NVDIFFREC=false
 ERROR=false
 
+# ``genrecon.vendor.cumesh_remeshing`` uses private extension entry points from
+# this exact revision.  Pin the checkout instead of silently building whatever
+# happens to be at CuMesh's default branch.
+CUMESH_COMMIT=12289e1062f0603f2f0d0771b02e1395d247f26f
+
 
 if [ "$#" -eq 1 ] ; then
     HELP=true
@@ -123,6 +128,8 @@ fi
 if [ "$CUMESH" = true ] ; then
     mkdir -p /tmp/extensions
     git clone https://github.com/JeffreyXiang/CuMesh.git /tmp/extensions/CuMesh --recursive
+    git -C /tmp/extensions/CuMesh checkout "$CUMESH_COMMIT"
+    git -C /tmp/extensions/CuMesh submodule update --init --recursive
     pip install /tmp/extensions/CuMesh --no-build-isolation
 fi
 

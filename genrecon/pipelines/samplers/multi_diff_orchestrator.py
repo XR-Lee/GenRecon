@@ -11,6 +11,136 @@ class MultiDiffusionOrchestrator:
     def __init__(self, sampler):
         self.sampler = sampler
 
+    @staticmethod
+    def _prepare_overlap_diagnostic_pairs(
+        chunks: list[Any],
+        relative_transl: list[torch.Tensor],
+        resolution: int,
+        chunk_ids: list[int],
+        roi_bounds: Optional[list[tuple[tuple[float, float, float], tuple[float, float, float]]]] = None,
+    ) -> list[dict[str, Any]]:
+        """Precompute matching overlap rows without affecting sampler state."""
+        device = chunks[0].device if isinstance(chunks[0], torch.Tensor) else chunks[0].feats.device
+        offsets = [((translation.to(device) * resolution).round().long()) for translation in relative_transl]
+        mins = torch.stack(offsets).min(dim=0).values
+        maxs = torch.stack(offsets).max(dim=0).values + resolution
+        _, global_y, global_z = (maxs - mins).tolist()
+        pairs: list[dict[str, Any]] = []
+
+        for index_a in range(len(chunks)):
+            for index_b in range(index_a + 1, len(chunks)):
+                intersection_min = torch.maximum(offsets[index_a], offsets[index_b])
+                intersection_max = torch.minimum(
+                    offsets[index_a] + resolution,
+                    offsets[index_b] + resolution,
+                )
+                extent = intersection_max - intersection_min
+                if bool((extent <= 0).any()):
+                    continue
+
+                pair: dict[str, Any] = {
+                    "index_a": index_a,
+                    "index_b": index_b,
+                    "chunk_a": int(chunk_ids[index_a]),
+                    "chunk_b": int(chunk_ids[index_b]),
+                }
+                if isinstance(chunks[0], torch.Tensor):
+                    pair["slices_a"] = tuple(
+                        slice(int(value), int(value + size))
+                        for value, size in zip((intersection_min - offsets[index_a]).tolist(), extent.tolist())
+                    )
+                    pair["slices_b"] = tuple(
+                        slice(int(value), int(value + size))
+                        for value, size in zip((intersection_min - offsets[index_b]).tolist(), extent.tolist())
+                    )
+                    pair["overlap_voxels"] = int(torch.prod(extent).item())
+                    if roi_bounds:
+                        axes = [
+                            torch.arange(
+                                int(intersection_min[axis]),
+                                int(intersection_max[axis]),
+                                device=device,
+                            )
+                            for axis in range(3)
+                        ]
+                        global_xyz = torch.stack(torch.meshgrid(*axes, indexing="ij"), dim=-1).reshape(-1, 3)
+                        points = (global_xyz.float() + 0.5) / resolution - 0.5
+                        roi_mask = torch.zeros(len(points), dtype=torch.bool, device=device)
+                        for lower, upper in roi_bounds:
+                            lo = torch.tensor(lower, device=device, dtype=points.dtype)
+                            hi = torch.tensor(upper, device=device, dtype=points.dtype)
+                            roi_mask |= ((points >= lo) & (points <= hi)).all(dim=1)
+                        pair["roi_mask"] = roi_mask
+                        pair["roi_overlap_voxels"] = int(roi_mask.sum().item())
+                else:
+                    coords_a = chunks[index_a].coords[:, 1:].long() + (offsets[index_a] - mins)
+                    coords_b = chunks[index_b].coords[:, 1:].long() + (offsets[index_b] - mins)
+                    keys_a = coords_a[:, 0] * (global_y * global_z) + coords_a[:, 1] * global_z + coords_a[:, 2]
+                    keys_b = coords_b[:, 0] * (global_y * global_z) + coords_b[:, 1] * global_z + coords_b[:, 2]
+                    keys_b_sorted, order_b = torch.sort(keys_b)
+                    positions = torch.searchsorted(keys_b_sorted, keys_a)
+                    in_range = positions < len(keys_b_sorted)
+                    positions_safe = positions.clamp(max=max(0, len(keys_b_sorted) - 1))
+                    matching = in_range & (keys_b_sorted[positions_safe] == keys_a)
+                    rows_a = torch.nonzero(matching, as_tuple=False).squeeze(1)
+                    if not len(rows_a):
+                        continue
+                    rows_b = order_b[positions_safe[matching]]
+                    pair["rows_a"] = rows_a
+                    pair["rows_b"] = rows_b
+                    pair["overlap_voxels"] = int(len(rows_a))
+                    if roi_bounds:
+                        global_xyz = chunks[index_a].coords[rows_a, 1:].long() + offsets[index_a]
+                        points = (global_xyz.float() + 0.5) / resolution - 0.5
+                        roi_mask = torch.zeros(len(points), dtype=torch.bool, device=device)
+                        for lower, upper in roi_bounds:
+                            lo = torch.tensor(lower, device=device, dtype=points.dtype)
+                            hi = torch.tensor(upper, device=device, dtype=points.dtype)
+                            roi_mask |= ((points >= lo) & (points <= hi)).all(dim=1)
+                        pair["roi_mask"] = roi_mask
+                        pair["roi_overlap_voxels"] = int(roi_mask.sum().item())
+                pairs.append(pair)
+        return pairs
+
+    @staticmethod
+    def _measure_overlap_pair(chunks: list[Any], pair: dict[str, Any], step_size: float) -> dict[str, float]:
+        if isinstance(chunks[0], torch.Tensor):
+            value_a = chunks[pair["index_a"]][(slice(None), slice(None), *pair["slices_a"])]
+            value_b = chunks[pair["index_b"]][(slice(None), slice(None), *pair["slices_b"])]
+            channels = value_a.shape[1]
+            value_a = value_a.movedim(1, -1).reshape(-1, channels)
+            value_b = value_b.movedim(1, -1).reshape(-1, channels)
+        else:
+            value_a = chunks[pair["index_a"]].feats[pair["rows_a"]]
+            value_b = chunks[pair["index_b"]].feats[pair["rows_b"]]
+
+        def measure(left: torch.Tensor, right: torch.Tensor) -> dict[str, float]:
+            left = left.float()
+            right = right.float()
+            difference = left - right
+            state_rmse = torch.sqrt(torch.mean(difference.square()))
+            state_mae = torch.mean(torch.abs(difference))
+            reference_rms = torch.sqrt(0.5 * torch.mean(left.square() + right.square()))
+            denominator = left.norm(dim=1) * right.norm(dim=1)
+            cosine_valid = denominator > 1e-12
+            if bool(cosine_valid.any()):
+                cosine = ((left * right).sum(dim=1)[cosine_valid] / denominator[cosine_valid]).mean()
+            else:
+                cosine = torch.tensor(float("nan"), device=left.device)
+            return {
+                "state_rmse": float(state_rmse.item()),
+                "state_mae": float(state_mae.item()),
+                "relative_state_rmse": float((state_rmse / reference_rms.clamp_min(1e-12)).item()),
+                "velocity_disagreement_rmse": float((state_rmse / max(step_size, 1e-12)).item()),
+                "cosine_similarity": float(cosine.item()),
+            }
+
+        result = measure(value_a, value_b)
+        roi_mask = pair.get("roi_mask")
+        if roi_mask is not None and bool(roi_mask.any()):
+            result.update({f"roi_{key}": value for key, value in measure(value_a[roi_mask], value_b[roi_mask]).items()})
+        return result
+
     # ------------------------------------------------------------------
     # Prediction Aggregation
     # ------------------------------------------------------------------
@@ -357,9 +487,27 @@ class MultiDiffusionOrchestrator:
         chunk_kwargs: Optional[list[dict]] = None,
         boundary_sensitive: bool = False,
         boundary_width: int = 2,
+        overlap_diagnostics: Optional[list[dict[str, Any]]] = None,
+        diagnostics_stage: Optional[str] = None,
+        chunk_ids: Optional[list[int]] = None,
+        diagnostics_roi_bounds: Optional[
+            list[tuple[tuple[float, float, float], tuple[float, float, float]]]
+        ] = None,
     ):
         num_chunks = len(noise)
         chunks = self._initialize_noise(noise, relative_transl, model.resolution)
+        diagnostic_pairs: list[dict[str, Any]] = []
+        if overlap_diagnostics is not None:
+            resolved_chunk_ids = list(range(num_chunks)) if chunk_ids is None else list(chunk_ids)
+            if len(resolved_chunk_ids) != num_chunks:
+                raise ValueError("chunk_ids must match the number of sampled chunks")
+            diagnostic_pairs = self._prepare_overlap_diagnostic_pairs(
+                chunks,
+                relative_transl,
+                model.resolution,
+                resolved_chunk_ids,
+                diagnostics_roi_bounds,
+            )
 
         t_seq = np.linspace(1, 0, steps + 1)
         t_seq = rescale_t * t_seq / (1 + (rescale_t - 1) * t_seq)
@@ -379,7 +527,7 @@ class MultiDiffusionOrchestrator:
         else:
             aggregate = self._aggregate_overlaps
 
-        for t, t_prev in tqdm.tqdm(t_pairs, desc=tqdm_desc, disable=not verbose):
+        for step_index, (t, t_prev) in enumerate(tqdm.tqdm(t_pairs, desc=tqdm_desc, disable=not verbose)):
             for i in range(num_chunks):
                 extra = chunk_kwargs[i] if chunk_kwargs is not None else {}
                 v = self.sampler._inference_model(
@@ -394,6 +542,23 @@ class MultiDiffusionOrchestrator:
                     **extra,
                 )
                 chunks[i] = chunks[i] - (t - t_prev) * v
+            if overlap_diagnostics is not None:
+                step_size = abs(float(t - t_prev))
+                for pair in diagnostic_pairs:
+                    overlap_diagnostics.append(
+                        {
+                            "stage": diagnostics_stage or tqdm_desc,
+                            "step": step_index,
+                            "t": float(t),
+                            "t_prev": float(t_prev),
+                            "resolution": int(model.resolution),
+                            "chunk_a": pair["chunk_a"],
+                            "chunk_b": pair["chunk_b"],
+                            "overlap_voxels": pair["overlap_voxels"],
+                            "roi_overlap_voxels": pair.get("roi_overlap_voxels", 0),
+                            **self._measure_overlap_pair(chunks, pair, step_size),
+                        }
+                    )
             chunks = aggregate(chunks, relative_transl, model.resolution)
 
         return chunks

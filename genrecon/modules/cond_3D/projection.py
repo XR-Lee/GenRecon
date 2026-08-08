@@ -47,6 +47,124 @@ def project_points_to_patches(
     return cam, valid, patch_ids
 
 
+def points_in_bounds(points: torch.Tensor, bounds: torch.Tensor) -> torch.Tensor:
+    bounds = bounds.to(device=points.device, dtype=points.dtype)
+    if bounds.numel() == 0:
+        return torch.zeros(len(points), dtype=torch.bool, device=points.device)
+    lower = bounds[:, 0].unsqueeze(1)
+    upper = bounds[:, 1].unsqueeze(1)
+    return (((points.unsqueeze(0) >= lower) & (points.unsqueeze(0) <= upper)).all(dim=-1)).any(dim=0)
+
+
+def _ownership_roi_mask(points: torch.Tensor, ownership: dict) -> torch.Tensor:
+    return points_in_bounds(points, ownership["roi_bounds"])
+
+
+def apply_projection_ownership(
+    points: torch.Tensor,
+    coords_cam: torch.Tensor,
+    patch_ids: torch.Tensor,
+    valid: torch.Tensor,
+    ownership: Optional[dict],
+    global_img_tokens: int,
+) -> torch.Tensor:
+    """Restrict in-frustum projection candidates with SAM/track ownership.
+
+    Outside the registered object ROI, the original validity rule is preserved.
+    Inside it, ``mask`` mode requires the projected patch to belong to the
+    prompted object. ``depth`` mode additionally keeps only a track-depth
+    surface band; patches without track depth can optionally remain unknown.
+    """
+    if ownership is None:
+        return valid
+    mask = ownership["mask"].to(device=valid.device)
+    if mask.shape[0] != valid.shape[0]:
+        raise ValueError(f"ownership has {mask.shape[0]} views, projection has {valid.shape[0]}")
+    local_patch_ids = patch_ids - global_img_tokens
+    if local_patch_ids.min() < 0 or local_patch_ids.max() >= mask.shape[1]:
+        raise ValueError("ownership patch grid does not match the projection token grid")
+    owned_patch = mask.gather(1, local_patch_ids)
+    if ownership.get("global_feature_filter", False):
+        inside = torch.ones((1, len(points)), dtype=torch.bool, device=valid.device)
+    else:
+        inside = _ownership_roi_mask(points, ownership).unsqueeze(0)
+    allowed = owned_patch
+    if ownership["mode"] == "depth":
+        depth_valid = ownership["depth_valid"].to(device=valid.device).gather(1, local_patch_ids)
+        surface_depth = ownership["surface_depth"].to(
+            device=coords_cam.device, dtype=coords_cam.dtype
+        ).gather(1, local_patch_ids)
+        surface = depth_valid & (
+            (coords_cam[..., 2] - surface_depth).abs() <= float(ownership["surface_band"])
+        )
+        unknown = owned_patch & ~depth_valid if ownership.get("allow_unknown", True) else torch.zeros_like(surface)
+        allowed = owned_patch & (surface | unknown)
+    return valid & (~inside | allowed)
+
+
+def classify_projection_ownership(
+    points: torch.Tensor,
+    extrinsics: torch.Tensor,
+    intrinsics: torch.Tensor,
+    ownership: dict,
+    *,
+    img_patch_res: int,
+    global_img_tokens: int = 0,
+    eps: float = 1e-6,
+) -> dict[str, torch.Tensor]:
+    """Classify object-ROI points as free/surface/occluded from track depth."""
+    if ownership["mode"] != "depth":
+        raise ValueError("free-space classification requires depth ownership mode")
+    if extrinsics.shape[0] != 1 or intrinsics.shape[0] != 1:
+        raise ValueError("projection ownership classification expects one scene batch")
+    num_views = extrinsics.shape[1]
+    ones = torch.ones((len(points), 1), device=points.device, dtype=points.dtype)
+    points_h = torch.cat([points, ones], dim=1).unsqueeze(0)
+    coords_cam, valid, patch_ids = project_points_to_patches(
+        points_h,
+        extrinsics.reshape(num_views, 1, 4, 4),
+        intrinsics.reshape(num_views, 1, 3, 3),
+        img_patch_res,
+        global_img_tokens,
+        eps=eps,
+    )
+    mask = ownership["mask"].to(device=points.device)
+    local_patch_ids = patch_ids - global_img_tokens
+    owned = mask.gather(1, local_patch_ids)
+    known = ownership["depth_valid"].to(device=points.device).gather(1, local_patch_ids)
+    reference = ownership["surface_depth"].to(
+        device=points.device, dtype=coords_cam.dtype
+    ).gather(1, local_patch_ids)
+    ray_valid = valid & owned & known
+    delta = coords_cam[..., 2] - reference
+    band = float(ownership["surface_band"])
+    free = ray_valid & (delta < -band)
+    surface = ray_valid & (delta.abs() <= band)
+    occluded = ray_valid & (delta > band)
+    inside = _ownership_roi_mask(points, ownership)
+    support_bounds = ownership.get("support_bounds")
+    if support_bounds is not None and support_bounds.numel():
+        inside_support = points_in_bounds(points, support_bounds)
+    else:
+        inside_support = torch.ones(len(points), dtype=torch.bool, device=points.device)
+    free_votes = free.sum(dim=0)
+    surface_votes = surface.sum(dim=0)
+    occluded_votes = occluded.sum(dim=0)
+    depth_free = inside & (free_votes >= int(ownership["min_free_views"])) & (surface_votes == 0)
+    outside_support = ~inside_support if ownership.get("hard_support", False) else torch.zeros_like(inside_support)
+    hard_free = depth_free | outside_support
+    return {
+        "inside_roi": inside,
+        "inside_support": inside_support,
+        "outside_support": outside_support,
+        "depth_free": depth_free,
+        "free_votes": free_votes,
+        "surface_votes": surface_votes,
+        "occluded_votes": occluded_votes,
+        "hard_free": hard_free,
+    }
+
+
 class Projection(nn.Module):
     def __init__(
         self,
@@ -167,6 +285,7 @@ def project_features_on_points(
     extrinsics: torch.Tensor,  # [1, N, 4, 4]
     intrinsics: torch.Tensor,  # [1, N, 3, 3]
     eps: float = 1e-6,
+    ownership: Optional[dict] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Project image patch features onto arbitrary voxel positions.
 
@@ -207,6 +326,14 @@ def project_features_on_points(
     patch_u = torch.floor(u * proj.img_patch_res).long().clamp(0, proj.img_patch_res - 1)
     patch_v = torch.floor(v * proj.img_patch_res).long().clamp(0, proj.img_patch_res - 1)
     patch_ids = patch_v * proj.img_patch_res + patch_u + proj.global_img_tokens
+    valid = apply_projection_ownership(
+        points,
+        coords_cam,
+        patch_ids,
+        valid,
+        ownership,
+        proj.global_img_tokens,
+    )
     gather_idx = patch_ids.unsqueeze(-1).expand(-1, -1, D)
 
     projection = cond_f.gather(dim=1, index=gather_idx)  # [M, S, D]

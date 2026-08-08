@@ -572,7 +572,7 @@ class ScannetIphoneMixin:
                 }
 
         if any(c["needs_undistort"] for c in cam_table.values()):
-            image_root_undist.mkdir(exist_ok=True)
+            image_root_undist.mkdir(parents=True, exist_ok=True)
 
         # ── Parse images.txt: 2 lines per image (header + POINTS2D); we only need the header ─
         cameras: list[dict] = []

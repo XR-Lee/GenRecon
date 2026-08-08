@@ -476,7 +476,13 @@ class ScannetMixin:
     ) -> tuple[list[list[float]], list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
         clean_kwargs = {
             k: getattr(self, k)
-            for k in ("stat_std_ratio", "radius_nb_points", "radius_m")
+            for k in (
+                "max_reproj_error",
+                "min_track_len",
+                "stat_std_ratio",
+                "radius_nb_points",
+                "radius_m",
+            )
             if getattr(self, k, None) is not None
         }
         clean_points = self._get_clean_points(path, out_path, **clean_kwargs)
@@ -484,6 +490,12 @@ class ScannetMixin:
         manual_xy = getattr(self, "manual_xy_bounds", None)
         if manual_xy is not None:
             x_min, x_max, y_min, y_max = manual_xy
+        manual_z = getattr(self, "manual_z_bounds", None)
+        if manual_z is not None:
+            z_floor, z_ceiling = manual_z
+            if z_floor >= z_ceiling:
+                raise ValueError(f"manual_z_bounds must satisfy floor < ceiling; got {manual_z}")
+            delta_z = z_ceiling - z_floor
         chunk_size = delta_z * self.chunk_size_factor
         chunk_centers = self._define_centers(x_min, x_max, y_min, y_max, z_floor, chunk_size)
         red_chunk_centers = self._remove_empty_chunks(
@@ -565,18 +577,26 @@ class IphoneChunker(BaseChunker, IphoneMixin):
         min_overlap_factor: int = 4,
         chunk_size_factor: float = 1.08,
         colmap_subdir: str = "colmap_mast3r",
+        max_reproj_error: float | None = None,
+        min_track_len: int | None = None,
         stat_std_ratio: float | None = None,
         radius_nb_points: int | None = None,
         radius_m: float | None = None,
         manual_xy_bounds: tuple[float, float, float, float] | None = None,
+        manual_z_bounds: tuple[float, float] | None = None,
         min_points_per_chunk: int | None = None,
+        skip_point_cleaning: bool = False,
     ) -> None:
         super().__init__(min_overlap_factor=min_overlap_factor)
         self.chunk_size_factor = chunk_size_factor
         self.colmap_subdir = colmap_subdir
+        self.max_reproj_error = max_reproj_error
+        self.min_track_len = min_track_len
         self.stat_std_ratio = stat_std_ratio
         self.radius_nb_points = radius_nb_points
         self.radius_m = radius_m
         self.manual_xy_bounds = manual_xy_bounds
+        self.manual_z_bounds = manual_z_bounds
+        self.skip_point_cleaning = skip_point_cleaning
         if min_points_per_chunk is not None:
             self.min_points_per_chunk = min_points_per_chunk

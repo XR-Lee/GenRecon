@@ -5,7 +5,11 @@ from typing import Optional
 
 import torch
 
-from ..modules.cond_3D.projection import project_features_on_points
+from ..modules.cond_3D.projection import (
+    classify_projection_ownership,
+    points_in_bounds,
+    project_features_on_points,
+)
 from ..modules.sparse import SparseTensor
 from ..representations import Mesh, MeshWithVoxel
 from .images_to_3d import ImagesTo3DPipeline
@@ -96,6 +100,100 @@ class FullSceneImagesTo3DPipeline(ImagesTo3DPipeline):
             "neg_cond": {"cond_2D": torch.zeros_like(cond_2D), "cond_3D": neg_cond_3D},
         }
 
+    @staticmethod
+    def _mask_dino_tokens(
+        features: torch.Tensor,
+        patch_masks: torch.Tensor,
+        global_tokens: int = 5,
+        *,
+        keep_global_tokens: bool = True,
+    ) -> tuple[torch.Tensor, dict]:
+        """Zero every DINO token that is not owned by the prompted object."""
+        if features.ndim != 4 or patch_masks.ndim != 2:
+            raise ValueError("features must be [1,N,T,D] and patch_masks must be [N,P]")
+        if features.shape[0] != 1 or features.shape[1] != patch_masks.shape[0]:
+            raise ValueError("feature views and object patch-mask views must match")
+        if features.shape[2] != global_tokens + patch_masks.shape[1]:
+            raise ValueError("object patch-mask resolution does not match DINO token count")
+        patch_masks = patch_masks.to(device=features.device, dtype=torch.bool)
+        active = patch_masks.any(dim=1, keepdim=True)
+        global_mask = (
+            active.expand(-1, global_tokens)
+            if keep_global_tokens
+            else torch.zeros(
+                (patch_masks.shape[0], global_tokens),
+                device=patch_masks.device,
+                dtype=torch.bool,
+            )
+        )
+        token_mask = torch.cat([global_mask, patch_masks], dim=1)
+        masked = features * token_mask.unsqueeze(0).unsqueeze(-1).to(features.dtype)
+        return masked, {
+            "views": int(patch_masks.shape[0]),
+            "active_views": int(active.sum().item()),
+            "kept_patch_tokens": int(patch_masks.sum().item()),
+            "total_patch_tokens": int(patch_masks.numel()),
+            "kept_global_tokens": int(global_mask.sum().item()),
+            "global_tokens_enabled": bool(keep_global_tokens),
+        }
+
+    @staticmethod
+    def _per_chunk_cond2d(
+        cond2d_feats: torch.Tensor,
+        chunk_indices: list[int],
+        shared_tokens: Optional[torch.Tensor] = None,
+        target_chunk_ids: Optional[set[int]] = None,
+    ) -> list[torch.Tensor]:
+        """Return independently sized cond2D sequences, optionally with shared tokens."""
+        result = []
+        target_chunk_ids = target_chunk_ids or set()
+        for position, chunk_id in enumerate(chunk_indices):
+            local = cond2d_feats[:, position]
+            if shared_tokens is not None and chunk_id in target_chunk_ids:
+                local = torch.cat([local, shared_tokens.to(device=local.device, dtype=local.dtype)], dim=1)
+            result.append(local)
+        return result
+
+    def _build_shared_anchor_tokens(
+        self,
+        flow_model,
+        scene_feats: torch.Tensor,
+        scene_ext_c0: torch.Tensor,
+        scene_intr: torch.Tensor,
+        anchor_points_chunk0: torch.Tensor,
+        anchor_view_mask: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Pool per-view DINO observations into one token per 3D instance anchor."""
+        points = anchor_points_chunk0.to(device=self.device, dtype=scene_feats.dtype)
+        projected, valid, _ = project_features_on_points(
+            flow_model.projection,
+            points,
+            scene_feats,
+            scene_ext_c0,
+            scene_intr,
+        )
+        features = projected.squeeze(0).permute(1, 0, 2).contiguous()  # [S, N, D]
+        mask = valid.squeeze(0).permute(1, 0).contiguous()  # [S, N]
+        if anchor_view_mask is not None:
+            if anchor_view_mask.shape != mask.shape:
+                raise ValueError(
+                    f"anchor_view_mask must have shape {tuple(mask.shape)}, got {tuple(anchor_view_mask.shape)}"
+                )
+            mask &= anchor_view_mask.to(device=mask.device, dtype=torch.bool)
+        counts = mask.sum(dim=1)
+        pooled = (features * mask.unsqueeze(-1)).sum(dim=1) / counts.clamp_min(1).unsqueeze(-1)
+
+        # Averaging views reduces feature norm. Restore the typical norm of the
+        # observed DINO patch tokens while preserving each track's direction.
+        observed_norms = features[mask].float().norm(dim=-1)
+        if len(observed_norms):
+            target_norm = observed_norms.median().to(dtype=pooled.dtype)
+            pooled = pooled * (target_norm / pooled.norm(dim=-1, keepdim=True).clamp_min(1e-6))
+        observed = counts > 0
+        if not bool(observed.any()):
+            raise ValueError("none of the instance anchors has a valid scene-view observation")
+        return pooled[observed].unsqueeze(0), counts[observed]
+
     # ─────────────────────────────────────────────────────────────────────
     # Dense SS: global grid → aggregate once → crop per chunk
     # ─────────────────────────────────────────────────────────────────────
@@ -104,15 +202,16 @@ class FullSceneImagesTo3DPipeline(ImagesTo3DPipeline):
         self,
         flow_model,
         scene_feats: torch.Tensor,  # [1, N, T, D]
-        cond2d_feats: torch.Tensor,  # [1, K, T, D]
+        cond2d_feats: list[torch.Tensor],  # K × [1, T_i, D]
         scene_ext_c0: torch.Tensor,  # [1, N, 4, 4]
         scene_intr: torch.Tensor,  # [1, N, 3, 3]
         rel_t: list[torch.Tensor],
         R: int,
         zero_3d_cond: bool = False,
+        projection_ownership: Optional[dict] = None,
     ) -> list[dict]:
         if not hasattr(flow_model, "projection") or not hasattr(flow_model, "aggregator"):
-            return [self._assemble_cond(cond_2D=cond2d_feats[:, i], cond_3D=None) for i in range(cond2d_feats.shape[1])]
+            return [self._assemble_cond(cond_2D=features, cond_3D=None) for features in cond2d_feats]
 
         offsets, (GX, GY, GZ), mins = self._global_grid_layout(rel_t, R)
         pts = self._global_grid_points(mins, GX, GY, GZ, R).to(
@@ -132,6 +231,7 @@ class FullSceneImagesTo3DPipeline(ImagesTo3DPipeline):
                 scene_feats,
                 scene_ext_c0,
                 scene_intr,
+                ownership=projection_ownership,
             )
             sub = flow_model.aggregator(proj, valid, cam_emb)  # [1, end-start, D]
             agg_chunks.append(sub.squeeze(0))
@@ -149,7 +249,7 @@ class FullSceneImagesTo3DPipeline(ImagesTo3DPipeline):
             chunk_cond_3D = cond_3D_vol[:, ox : ox + R, oy : oy + R, oz : oz + R, :].reshape(1, R**3, D)
             if zero_3d_cond:
                 chunk_cond_3D = torch.zeros_like(chunk_cond_3D)
-            conds.append(self._assemble_cond(cond_2D=cond2d_feats[:, i], cond_3D=chunk_cond_3D))
+            conds.append(self._assemble_cond(cond_2D=cond2d_feats[i], cond_3D=chunk_cond_3D))
         return conds
 
     # ─────────────────────────────────────────────────────────────────────
@@ -160,16 +260,17 @@ class FullSceneImagesTo3DPipeline(ImagesTo3DPipeline):
         self,
         flow_model,
         scene_feats: torch.Tensor,  # [1, N, T, D]
-        cond2d_feats: torch.Tensor,  # [1, K, T, D]
+        cond2d_feats: list[torch.Tensor],  # K × [1, T_i, D]
         scene_ext_c0: torch.Tensor,  # [1, N, 4, 4]
         scene_intr: torch.Tensor,  # [1, N, 3, 3]
         coords_list: list[torch.Tensor],  # K × [K_i, 4] (batch, x, y, z), chunk-local
         rel_t: list[torch.Tensor],
         R: int,
         zero_3d_cond: bool = False,
+        projection_ownership: Optional[dict] = None,
     ) -> list[dict]:
         if not hasattr(flow_model, "projection") or not hasattr(flow_model, "aggregator"):
-            return [self._assemble_cond(cond_2D=cond2d_feats[:, i], cond_3D=None) for i in range(cond2d_feats.shape[1])]
+            return [self._assemble_cond(cond_2D=features, cond_3D=None) for features in cond2d_feats]
 
         offsets, (GX, GY, GZ), mins = self._global_grid_layout(rel_t, R)
         offsets_dev = offsets.to(coords_list[0].device)
@@ -202,6 +303,7 @@ class FullSceneImagesTo3DPipeline(ImagesTo3DPipeline):
                 scene_feats,
                 scene_ext_c0,
                 scene_intr,
+                ownership=projection_ownership,
             )  # [1, N, end-start, D], [1, N, end-start]
             feats_SND = proj.squeeze(0).permute(1, 0, 2).contiguous()  # [end-start, N, D]
             mask_SN = valid.squeeze(0).permute(1, 0).contiguous()  # [end-start, N]
@@ -227,12 +329,85 @@ class FullSceneImagesTo3DPipeline(ImagesTo3DPipeline):
             chunk_cond_3D = SparseTensor(feats=feats_i, coords=coords_list[i])
             if zero_3d_cond:
                 chunk_cond_3D = chunk_cond_3D.replace(torch.zeros_like(chunk_cond_3D.feats))
-            conds.append(self._assemble_cond(cond_2D=cond2d_feats[:, i], cond_3D=chunk_cond_3D))
+            conds.append(self._assemble_cond(cond_2D=cond2d_feats[i], cond_3D=chunk_cond_3D))
         return conds
 
     # ─────────────────────────────────────────────────────────────────────
     # Joint-frame decoders (unchanged from prior revision)
     # ─────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _crop_mesh_to_support(scene_mesh: Mesh, support_bounds: torch.Tensor) -> dict:
+        """Keep only triangles whose three vertices lie in the object support."""
+        vertices_before = len(scene_mesh.vertices)
+        faces_before = len(scene_mesh.faces)
+        inside = points_in_bounds(scene_mesh.vertices, support_bounds)
+        faces_long = scene_mesh.faces.long()
+        keep = inside[faces_long].all(dim=1)
+        kept_faces = scene_mesh.faces[keep]
+        if not len(kept_faces):
+            raise RuntimeError("strict object support removed every decoded triangle")
+        used, inverse = torch.unique(kept_faces.reshape(-1).long(), sorted=True, return_inverse=True)
+        scene_mesh.vertices = scene_mesh.vertices[used]
+        scene_mesh.faces = inverse.reshape(-1, 3).to(dtype=torch.int32)
+        return {
+            "vertices_before": vertices_before,
+            "vertices_after": len(scene_mesh.vertices),
+            "faces_before": faces_before,
+            "faces_after": len(scene_mesh.faces),
+            "faces_removed": faces_before - len(scene_mesh.faces),
+            "vertices_outside_support_before_crop": int((~inside).sum().item()),
+        }
+
+    @staticmethod
+    def _hard_free_occupancy_masks(
+        projection_ownership: dict,
+        scene_ext_c0: torch.Tensor,
+        scene_intr: torch.Tensor,
+        relative_translations: list[torch.Tensor],
+        resolution: int,
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[dict]]:
+        """Classify decoded occupancy cells using mask-constrained track depth."""
+        axes = torch.meshgrid(
+            *[torch.arange(resolution, device=scene_ext_c0.device) for _ in range(3)],
+            indexing="ij",
+        )
+        local = torch.stack(axes, dim=-1).reshape(-1, 3).float()
+        local = (local + 0.5) / resolution - 0.5
+        masks: list[torch.Tensor] = []
+        surface_masks: list[torch.Tensor] = []
+        records: list[dict] = []
+        extrinsics = scene_ext_c0.float()
+        intrinsics = scene_intr.float()
+        for index, translation in enumerate(relative_translations):
+            points = local + translation.to(device=local.device, dtype=local.dtype)
+            states = classify_projection_ownership(
+                points,
+                extrinsics,
+                intrinsics,
+                projection_ownership,
+                img_patch_res=int(projection_ownership["patch_resolution"]),
+            )
+            hard_free = states["hard_free"].reshape(resolution, resolution, resolution)
+            surface = (
+                (states["surface_votes"] > 0) & states["inside_support"]
+            ).reshape(resolution, resolution, resolution)
+            masks.append(hard_free)
+            surface_masks.append(surface)
+            inside = states["inside_roi"]
+            records.append(
+                {
+                    "chunk_position": index,
+                    "roi_cells": int(inside.sum().item()),
+                    "support_cells": int(states["inside_support"].sum().item()),
+                    "outside_support_cells": int(states["outside_support"].sum().item()),
+                    "depth_free_cells": int(states["depth_free"].sum().item()),
+                    "hard_free_cells": int(hard_free.sum().item()),
+                    "cells_with_surface_vote": int(((states["surface_votes"] > 0) & inside).sum().item()),
+                    "cells_with_occluded_vote": int(((states["occluded_votes"] > 0) & inside).sum().item()),
+                }
+            )
+        return masks, surface_masks, records
 
     def extract_coords_from_occ_logits(
         self,
@@ -349,17 +524,20 @@ class FullSceneImagesTo3DPipeline(ImagesTo3DPipeline):
         if self.low_vram:
             dec.to(self.device)
             dec.low_vram = True
-        scene_mesh, aabb, grid_size_fine, ctx, meta = joint_decode_shape(
-            dec,
-            slats,
-            relative_transl,
-            max_chunks_per_group=max_chunks_per_group,
-            max_inflated_voxels=max_inflated_voxels,
-            overlap_r_in=overlap_r_in,
-        )
-        if self.low_vram:
-            dec.cpu()
-            dec.low_vram = False
+        try:
+            scene_mesh, aabb, grid_size_fine, ctx, meta = joint_decode_shape(
+                dec,
+                slats,
+                relative_transl,
+                max_chunks_per_group=max_chunks_per_group,
+                max_inflated_voxels=max_inflated_voxels,
+                overlap_r_in=overlap_r_in,
+                consume_inputs=True,
+            )
+        finally:
+            if self.low_vram:
+                dec.cpu()
+                dec.low_vram = False
         return scene_mesh, aabb, grid_size_fine, ctx, meta
 
     @torch.no_grad()
@@ -375,9 +553,11 @@ class FullSceneImagesTo3DPipeline(ImagesTo3DPipeline):
         dec = self.models["tex_slat_decoder"]
         if self.low_vram:
             dec.to(self.device)
-        out = joint_decode_tex(dec, slats, ctx, relative_transl)
-        if self.low_vram:
-            dec.cpu()
+        try:
+            out = joint_decode_tex(dec, slats, ctx, relative_transl, consume_inputs=True)
+        finally:
+            if self.low_vram:
+                dec.cpu()
         return out
 
     # ─────────────────────────────────────────────────────────────────────
@@ -396,6 +576,38 @@ class FullSceneImagesTo3DPipeline(ImagesTo3DPipeline):
             intr.unsqueeze(0).to(self.device, dtype=dtype),
         )
 
+    @staticmethod
+    def _sample_sparse_noise(flow_model, num_chunks: int, device: torch.device) -> list[torch.Tensor]:
+        """Sample one dense latent per chunk at the flow model's latent resolution."""
+        resolution = flow_model.resolution
+        dtype = getattr(flow_model, "dtype", torch.float32)
+        return [
+            torch.randn(
+                1,
+                flow_model.in_channels,
+                resolution,
+                resolution,
+                resolution,
+                dtype=dtype,
+                device=device,
+            )
+            for _ in range(num_chunks)
+        ]
+
+    @staticmethod
+    def _without_sparse_caches(sparse: SparseTensor) -> SparseTensor:
+        """Keep only sparse features/coords, dropping sampler backend caches."""
+        return SparseTensor(feats=sparse.feats, coords=sparse.coords)
+
+    @staticmethod
+    def _joint_decode_limits(pipeline_type: str, num_chunks: int, low_vram: bool) -> tuple[Optional[int], Optional[int]]:
+        """Return chunk/voxel caps for the scene-wide decoder."""
+        if pipeline_type == "1024":
+            return 10, 100_000
+        if low_vram and num_chunks > 16:
+            return 8, 80_000
+        return None, None
+
     @torch.no_grad()
     def run(
         self,
@@ -408,6 +620,21 @@ class FullSceneImagesTo3DPipeline(ImagesTo3DPipeline):
         pipeline_type: Optional[str] = None,
         occ_threshold: float = 0.0,
         zero_3d_cond: bool = False,
+        joint_decode_max_chunks_per_group: Optional[int] = None,
+        joint_decode_max_inflated_voxels: Optional[int] = None,
+        overlap_diagnostics: Optional[list[dict]] = None,
+        overlap_diagnostics_roi_bounds: Optional[
+            list[tuple[tuple[float, float, float], tuple[float, float, float]]]
+        ] = None,
+        instance_anchor_points_chunk0: Optional[torch.Tensor] = None,
+        instance_anchor_view_mask: Optional[torch.Tensor] = None,
+        instance_anchor_chunk_ids: Optional[list[int]] = None,
+        instance_anchor_diagnostics: Optional[dict] = None,
+        projection_ownership: Optional[dict] = None,
+        projection_ownership_diagnostics: Optional[dict] = None,
+        object_feature_only: bool = False,
+        object_feature_keep_global_tokens: bool = True,
+        cond2d_scene_view_indices: Optional[list[int]] = None,
     ) -> tuple[MeshWithVoxel, list[torch.Tensor]]:
         pipeline_type = pipeline_type or self.default_pipeline_type
         if pipeline_type not in ("512", "1024"):
@@ -416,6 +643,11 @@ class FullSceneImagesTo3DPipeline(ImagesTo3DPipeline):
 
         num_chunks = len(sel.chunk_indices)
         torch.manual_seed(seed)
+        if projection_ownership is not None:
+            projection_ownership = {
+                key: value.to(self.device) if isinstance(value, torch.Tensor) else value
+                for key, value in projection_ownership.items()
+            }
 
         res = int(pipeline_type)
         ss_res = 32 if pipeline_type == "512" else 64
@@ -439,6 +671,41 @@ class FullSceneImagesTo3DPipeline(ImagesTo3DPipeline):
             scene_feats_stage = scene_feats_512
             cond2d_feats_stage = cond2d_feats_512
 
+        if object_feature_only:
+            if projection_ownership is None:
+                raise ValueError("object_feature_only requires projection ownership masks")
+            if cond2d_scene_view_indices is None or len(cond2d_scene_view_indices) != num_chunks:
+                raise ValueError("object_feature_only requires one scene-view index per cond2D chunk")
+            scene_patch_masks = projection_ownership["mask"]
+            cond2d_patch_masks = scene_patch_masks[
+                torch.tensor(cond2d_scene_view_indices, device=scene_patch_masks.device)
+            ]
+            scene_feats_512, scene_token_record = self._mask_dino_tokens(
+                scene_feats_512,
+                scene_patch_masks,
+                keep_global_tokens=object_feature_keep_global_tokens,
+            )
+            cond2d_feats_512, cond2d_token_record = self._mask_dino_tokens(
+                cond2d_feats_512,
+                cond2d_patch_masks,
+                keep_global_tokens=object_feature_keep_global_tokens,
+            )
+            if pipeline_type == "512":
+                scene_feats_stage = scene_feats_512
+                cond2d_feats_stage = cond2d_feats_512
+            if projection_ownership_diagnostics is not None:
+                projection_ownership_diagnostics["object_feature_tokens"] = {
+                    "scene": scene_token_record,
+                    "cond2d": cond2d_token_record,
+                    "cond2d_scene_view_indices": list(cond2d_scene_view_indices),
+                }
+            print(
+                "[object_features] scene patches="
+                f"{scene_token_record['kept_patch_tokens']}/{scene_token_record['total_patch_tokens']} "
+                f"cond2d patches={cond2d_token_record['kept_patch_tokens']}/"
+                f"{cond2d_token_record['total_patch_tokens']}"
+            )
+
         # ── Stage 1: Sparse structure ─────────────────────────────────────────
         ss_model = self.models["sparse_structure_flow_model"]
         scene_ext_ss, scene_intr_ss = self._prep_extrinsics_intrinsics(
@@ -446,28 +713,46 @@ class FullSceneImagesTo3DPipeline(ImagesTo3DPipeline):
             sel.scene_intrinsics,
             ss_model.dtype,
         )
+        anchor_targets = set(instance_anchor_chunk_ids or [])
+        shared_ss_tokens = None
+        if instance_anchor_points_chunk0 is not None:
+            if not anchor_targets:
+                raise ValueError("instance anchor points require target chunk ids")
+            shared_ss_tokens, counts = self._build_shared_anchor_tokens(
+                ss_model,
+                scene_feats_512.to(ss_model.dtype),
+                scene_ext_ss,
+                scene_intr_ss,
+                instance_anchor_points_chunk0,
+                instance_anchor_view_mask,
+            )
+            if instance_anchor_diagnostics is not None:
+                instance_anchor_diagnostics["sparse_structure"] = {
+                    "tokens": int(shared_ss_tokens.shape[1]),
+                    "valid_view_count_min": int(counts.min().item()),
+                    "valid_view_count_median": float(counts.float().median().item()),
+                    "valid_view_count_max": int(counts.max().item()),
+                    "zero_view_tokens": int((counts == 0).sum().item()),
+                }
+            print(f"[instance_anchors] sparse_structure tokens={shared_ss_tokens.shape[1]} targets={sorted(anchor_targets)}")
+        ss_cond2d = self._per_chunk_cond2d(
+            cond2d_feats_512.to(ss_model.dtype),
+            sel.chunk_indices,
+            shared_ss_tokens,
+            anchor_targets,
+        )
         ss_conds = self._build_global_dense_cond(
             ss_model,
             scene_feats_512.to(ss_model.dtype),
-            cond2d_feats_512.to(ss_model.dtype),
+            ss_cond2d,
             scene_ext_ss,
             scene_intr_ss,
             relative_translations,
             ss_model.resolution,  # flow model samples at latent res; ss_res is the decoded occ res.
             zero_3d_cond=zero_3d_cond,
+            projection_ownership=projection_ownership,
         )
-        noise_ss = [
-            torch.randn(
-                1,
-                ss_model.in_channels,
-                ss_res,
-                ss_res,
-                ss_res,
-                dtype=getattr(ss_model, "dtype", torch.float32),
-                device=self.device,
-            )
-            for _ in range(num_chunks)
-        ]
+        noise_ss = self._sample_sparse_noise(ss_model, num_chunks, self.device)
         params_ss = {**self.sparse_structure_sampler_params, **sparse_structure_sampler_params}
 
         if self.low_vram:
@@ -481,6 +766,10 @@ class FullSceneImagesTo3DPipeline(ImagesTo3DPipeline):
                 relative_translations,
                 **params_ss,
                 tqdm_desc="Sampling sparse structure",
+                overlap_diagnostics=overlap_diagnostics,
+                diagnostics_stage="sparse_structure",
+                chunk_ids=sel.chunk_indices,
+                diagnostics_roi_bounds=overlap_diagnostics_roi_bounds,
             )
         if self.low_vram:
             ss_model.cpu()
@@ -489,6 +778,41 @@ class FullSceneImagesTo3DPipeline(ImagesTo3DPipeline):
         with _vram_peak(f"joint_decode_sparse_structure ({num_chunks} chunks, ss_res={ss_res})"):
             aggr_occ_logit_list = self.joint_decode_sparse_structure(z_s_list, relative_translations, ss_res)
         del z_s_list
+        if projection_ownership is not None and projection_ownership["mode"] == "depth":
+            free_masks, surface_masks, free_records = self._hard_free_occupancy_masks(
+                projection_ownership,
+                scene_ext_ss,
+                scene_intr_ss,
+                relative_translations,
+                ss_res,
+            )
+            removed_total = 0
+            seeded_total = 0
+            for logits, free_mask, surface_mask, record in zip(
+                aggr_occ_logit_list, free_masks, surface_masks, free_records
+            ):
+                removed = free_mask & (logits[0, 0] > occ_threshold)
+                record["occupied_cells_removed"] = int(removed.sum().item())
+                removed_total += record["occupied_cells_removed"]
+                logits[0, 0].masked_fill_(free_mask, float(occ_threshold - 20.0))
+                if projection_ownership.get("seed_surface", False):
+                    newly_seeded = surface_mask & (logits[0, 0] <= occ_threshold)
+                    record["surface_cells_seeded"] = int(newly_seeded.sum().item())
+                    seeded_total += record["surface_cells_seeded"]
+                    logits[0, 0].masked_fill_(surface_mask, float(occ_threshold + 20.0))
+                else:
+                    record["surface_cells_seeded"] = 0
+            if projection_ownership_diagnostics is not None:
+                projection_ownership_diagnostics["sparse_free_space"] = {
+                    "occupied_cells_removed": removed_total,
+                    "surface_cells_seeded": seeded_total,
+                    "chunks": free_records,
+                }
+            print(
+                f"[projection_ownership] hard-free occupancy cells removed={removed_total} "
+                f"surface cells seeded={seeded_total}"
+            )
+            del free_masks, surface_masks
 
         # ── Stage 2: Shape SLat ───────────────────────────────────────────────
         shape_model = self.models[shape_model_key]
@@ -507,16 +831,41 @@ class FullSceneImagesTo3DPipeline(ImagesTo3DPipeline):
             sel.scene_intrinsics,
             shape_model.dtype,
         )
+        shared_shape_tokens = None
+        if instance_anchor_points_chunk0 is not None:
+            shared_shape_tokens, counts = self._build_shared_anchor_tokens(
+                shape_model,
+                scene_feats_stage.to(shape_model.dtype),
+                scene_ext_shape,
+                scene_intr_shape,
+                instance_anchor_points_chunk0,
+                instance_anchor_view_mask,
+            )
+            if instance_anchor_diagnostics is not None:
+                instance_anchor_diagnostics["shape_slat"] = {
+                    "tokens": int(shared_shape_tokens.shape[1]),
+                    "valid_view_count_min": int(counts.min().item()),
+                    "valid_view_count_median": float(counts.float().median().item()),
+                    "valid_view_count_max": int(counts.max().item()),
+                    "zero_view_tokens": int((counts == 0).sum().item()),
+                }
+        shape_cond2d = self._per_chunk_cond2d(
+            cond2d_feats_stage.to(shape_model.dtype),
+            sel.chunk_indices,
+            shared_shape_tokens,
+            anchor_targets,
+        )
         shape_conds = self._build_global_sparse_cond(
             shape_model,
             scene_feats_stage.to(shape_model.dtype),
-            cond2d_feats_stage.to(shape_model.dtype),
+            shape_cond2d,
             scene_ext_shape,
             scene_intr_shape,
             coords_list,
             relative_translations,
             shape_model.resolution,
             zero_3d_cond=zero_3d_cond,
+            projection_ownership=projection_ownership,
         )
         noise_shape = [
             SparseTensor(
@@ -538,12 +887,16 @@ class FullSceneImagesTo3DPipeline(ImagesTo3DPipeline):
                 relative_translations,
                 **params_shape,
                 tqdm_desc="Sampling shape SLat",
+                overlap_diagnostics=overlap_diagnostics,
+                diagnostics_stage="shape_slat",
+                chunk_ids=sel.chunk_indices,
+                diagnostics_roi_bounds=overlap_diagnostics_roi_bounds,
             )
         if self.low_vram:
             shape_model.cpu()
         del shape_conds, noise_shape
 
-        shape_slat_list = [s * std + mean for s in shape_slat_raw]
+        shape_slat_list = [self._without_sparse_caches(s * std + mean) for s in shape_slat_raw]
         del shape_slat_raw
 
         # ── Stage 3: Tex SLat ─────────────────────────────────────────────────
@@ -551,23 +904,48 @@ class FullSceneImagesTo3DPipeline(ImagesTo3DPipeline):
         tex_std = torch.tensor(self.tex_slat_normalization["std"])[None].to(self.device)
         tex_mean = torch.tensor(self.tex_slat_normalization["mean"])[None].to(self.device)
 
-        shape_slat_norm = [(s - mean) / std for s in shape_slat_list]
+        shape_slat_norm = [self._without_sparse_caches((s - mean) / std) for s in shape_slat_list]
 
         scene_ext_tex, scene_intr_tex = self._prep_extrinsics_intrinsics(
             sel.scene_extrinsics_c0,
             sel.scene_intrinsics,
             tex_model.dtype,
         )
+        shared_tex_tokens = None
+        if instance_anchor_points_chunk0 is not None:
+            shared_tex_tokens, counts = self._build_shared_anchor_tokens(
+                tex_model,
+                scene_feats_stage.to(tex_model.dtype),
+                scene_ext_tex,
+                scene_intr_tex,
+                instance_anchor_points_chunk0,
+                instance_anchor_view_mask,
+            )
+            if instance_anchor_diagnostics is not None:
+                instance_anchor_diagnostics["texture_slat"] = {
+                    "tokens": int(shared_tex_tokens.shape[1]),
+                    "valid_view_count_min": int(counts.min().item()),
+                    "valid_view_count_median": float(counts.float().median().item()),
+                    "valid_view_count_max": int(counts.max().item()),
+                    "zero_view_tokens": int((counts == 0).sum().item()),
+                }
+        tex_cond2d = self._per_chunk_cond2d(
+            cond2d_feats_stage.to(tex_model.dtype),
+            sel.chunk_indices,
+            shared_tex_tokens,
+            anchor_targets,
+        )
         tex_conds = self._build_global_sparse_cond(
             tex_model,
             scene_feats_stage.to(tex_model.dtype),
-            cond2d_feats_stage.to(tex_model.dtype),
+            tex_cond2d,
             scene_ext_tex,
             scene_intr_tex,
             [sn.coords for sn in shape_slat_norm],
             relative_translations,
             tex_model.resolution,
             zero_3d_cond=zero_3d_cond,
+            projection_ownership=projection_ownership,
         )
         noise_tex = [
             sn.replace(
@@ -594,17 +972,31 @@ class FullSceneImagesTo3DPipeline(ImagesTo3DPipeline):
                 **params_tex,
                 tqdm_desc="Sampling texture SLat",
                 chunk_kwargs=chunk_kwargs_tex,
+                overlap_diagnostics=overlap_diagnostics,
+                diagnostics_stage="texture_slat",
+                chunk_ids=sel.chunk_indices,
+                diagnostics_roi_bounds=overlap_diagnostics_roi_bounds,
             )
         if self.low_vram:
             tex_model.cpu()
         del tex_conds, noise_tex, chunk_kwargs_tex, shape_slat_norm
 
-        tex_slat_list = [s * tex_std + tex_mean for s in tex_slat_raw]
+        tex_slat_list = [self._without_sparse_caches(s * tex_std + tex_mean) for s in tex_slat_raw]
         del tex_slat_raw
 
+        # Everything below consumes only the two SLat lists and the relative
+        # translations. Drop completed-stage tensors before the decoders reach
+        # their peak, and keep the returned occupancy coordinates on CPU.
+        coords_list = [coords.cpu() for coords in coords_list]
+        del scene_feats_512, cond2d_feats_512, scene_feats_stage, cond2d_feats_stage
+        del scene_ext_ss, scene_intr_ss, scene_ext_shape, scene_intr_shape
+        del scene_ext_tex, scene_intr_tex, std, mean, tex_std, tex_mean
+        del ss_model, shape_model, tex_model
+
         # ── Decode ────────────────────────────────────────────────────────────
-        # Chunked joint decode is enabled for the 1024 pipeline only; 512 keeps
-        # the original single-pass behavior verbatim.
+        # 512 keeps the original single-pass behavior through 16 chunks. Larger
+        # low-VRAM scenes use the same overlap-aware grouping as 1024 because a
+        # single forward exceeds a 16 GiB device.
         #
         # max_inflated_voxels caps the *actual* number of voxels the per-group
         # forward will see (joint_slat coords inside the inflated AABB) — the
@@ -612,8 +1004,15 @@ class FullSceneImagesTo3DPipeline(ImagesTo3DPipeline):
         # an 80 GB card; in=164K → 63 GB peak with no headroom for the next
         # group. 100K leaves ~35 GB headroom for cumulative state + safety.
         # max_chunks_per_group is a soft secondary bound for very sparse scenes.
-        max_chunks_per_group = 10 if pipeline_type == "1024" else None
-        max_inflated_voxels = 100_000 if pipeline_type == "1024" else None
+        max_chunks_per_group, max_inflated_voxels = self._joint_decode_limits(
+            pipeline_type,
+            num_chunks,
+            self.low_vram,
+        )
+        if joint_decode_max_chunks_per_group is not None:
+            max_chunks_per_group = joint_decode_max_chunks_per_group
+        if joint_decode_max_inflated_voxels is not None:
+            max_inflated_voxels = joint_decode_max_inflated_voxels
         torch.cuda.empty_cache()
         with _vram_peak(f"joint_decode_shape ({num_chunks} chunks, res={res})"):
             scene_mesh, aabb, grid_size_fine, decode_ctx, joint_meta = self.joint_decode_shape_slats(
@@ -626,6 +1025,15 @@ class FullSceneImagesTo3DPipeline(ImagesTo3DPipeline):
         del shape_slat_list
         torch.cuda.empty_cache()
 
+        # Texture decoding does not use geometry. A scene mesh can occupy
+        # hundreds of MiB, enough to make the following single-pass decoder
+        # fail despite its own working set fitting the device.
+        if self.low_vram and scene_mesh.device.type == "cuda":
+            scene_mesh_cpu = scene_mesh.cpu()
+            del scene_mesh
+            scene_mesh = scene_mesh_cpu
+            torch.cuda.empty_cache()
+
         with _vram_peak(f"joint_decode_tex ({num_chunks} chunks, res={res})"):
             joint_tex = self.joint_decode_tex_slats(tex_slat_list, decode_ctx, relative_translations)
         del tex_slat_list, decode_ctx, joint_meta
@@ -633,6 +1041,24 @@ class FullSceneImagesTo3DPipeline(ImagesTo3DPipeline):
 
         with _vram_peak("fill_holes (scene)"):
             scene_mesh.fill_holes()
+
+        if projection_ownership is not None and projection_ownership.get("hard_support", False):
+            support_crop = self._crop_mesh_to_support(
+                scene_mesh,
+                projection_ownership["support_bounds"],
+            )
+            if projection_ownership_diagnostics is not None:
+                projection_ownership_diagnostics["mesh_support_crop"] = support_crop
+            print(
+                "[object_support] mesh faces="
+                f"{support_crop['faces_before']}->{support_crop['faces_after']} "
+                f"vertices={support_crop['vertices_before']}->{support_crop['vertices_after']}"
+            )
+
+        if scene_mesh.device != joint_tex.feats.device:
+            scene_mesh_device = scene_mesh.to(joint_tex.feats.device)
+            del scene_mesh
+            scene_mesh = scene_mesh_device
 
         # Build one scene-wide MeshWithVoxel in the joint frame (chunk-0 local).
         voxel_shape = torch.Size([1, joint_tex.feats.shape[1], *grid_size_fine.tolist()])

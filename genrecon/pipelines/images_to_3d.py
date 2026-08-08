@@ -78,9 +78,17 @@ class ImagesTo3DPipeline(Pipeline):
         cls,
         stage_models: dict[str, str | None],
         pipeline_config_file: str | None = None,
+        stage_config_files: dict[str, str | None] | None = None,
     ) -> "ImagesTo3DPipeline":
         """Build a partially loaded pipeline from explicit pretrained or finetuned stage selections."""
         validate_requested_stage_models(stage_models)
+        stage_config_files = stage_config_files or {}
+        unknown_config_keys = set(stage_config_files) - set(stage_models)
+        if unknown_config_keys:
+            raise ValueError(
+                "Stage config keys must match requested stage models; unexpected keys: "
+                f"{sorted(unknown_config_keys)}"
+            )
 
         args = load_pipeline_args(pipeline_config_file or cls.DEFAULT_PIPELINE_CONFIG_FILE)
         pipeline = cls(models={})
@@ -95,7 +103,13 @@ class ImagesTo3DPipeline(Pipeline):
         load_report: dict[str, dict] = {}
 
         for model_key, ckpt_path in stage_models.items():
+            train_config_path = stage_config_files.get(model_key)
             if ckpt_path is None:
+                if train_config_path is not None:
+                    raise ValueError(
+                        f"A training config was provided for pretrained stage '{model_key}', "
+                        "but no finetuned checkpoint path was supplied."
+                    )
                 pipeline.models[model_key] = load_pretrained_model_from_args(
                     args,
                     model_key,
@@ -105,17 +119,22 @@ class ImagesTo3DPipeline(Pipeline):
                 continue
 
             if model_key == "sparse_structure_flow_model":
-                loaded = load_sparse_flow_stage(ckpt_path=ckpt_path)
+                loaded = load_sparse_flow_stage(
+                    ckpt_path=ckpt_path,
+                    train_config_path=train_config_path,
+                )
             elif model_key.startswith("shape_slat_flow_model_"):
                 loaded = load_slat_stage(
                     ckpt_path=ckpt_path,
                     allowed_model_names={"SLatFlowModel", "ElasticSLatFlowModel"},
+                    train_config_path=train_config_path,
                 )
                 validate_loaded_stage_resolution(model_key, loaded.output_resolution)
             elif model_key.startswith("tex_slat_flow_model_"):
                 loaded = load_slat_stage(
                     ckpt_path=ckpt_path,
                     allowed_model_names={"SLatFlowModel", "ElasticSLatFlowModel"},
+                    train_config_path=train_config_path,
                 )
                 validate_loaded_stage_resolution(model_key, loaded.output_resolution)
             else:

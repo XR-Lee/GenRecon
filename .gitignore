@@ -209,3 +209,10 @@ __marimo__/
 # Results
 *.jpg
 /visualization
+
+# Local reproduction artifacts
+/data/
+/weights/
+/outputs/
+/logs/
+/reports/generated/
