@@ -1,0 +1,170 @@
+{
+  "schema": "genrecon.gt-calibration-plan",
+  "schema_version": 1,
+  "plan_id": "gt-calibration-v1",
+  "expected_unit_count": 76,
+  "seed": 42,
+  "primary_conditioning_views": 8,
+  "heldout_views": 8,
+  "absolute_thresholds_m": [0.02, 0.05, 0.1],
+  "normalized_thresholds_bbox_diagonal": [0.005, 0.01, 0.02],
+  "datasets": {
+    "da3-scannetpp": {
+      "track": "scene",
+      "gt_tier": "G0-independent-scan",
+      "capture_kind": "iphone-rgbd",
+      "source_url": "https://huggingface.co/datasets/depth-anything/DA3-BENCH",
+      "license_status": "source-terms-apply",
+      "unit_ids": [
+        "09c1414f1b",
+        "1ada7a0617",
+        "21d970d8de",
+        "286b55a2bf",
+        "38d58a7a31",
+        "3e8bba0176",
+        "40aec5fffa",
+        "578511c8a9",
+        "5f99900f09",
+        "7831862f02",
+        "7bc286c1b6",
+        "9071e139d9",
+        "acd95847c5",
+        "bcd2436daf",
+        "bde1e479ad",
+        "c4c04e6d6c",
+        "c5439f4607",
+        "cc5237fd77",
+        "f3d64c30f8",
+        "fb5a96b1a2"
+      ]
+    },
+    "eth3d-indoor-training": {
+      "track": "scene",
+      "gt_tier": "G0-independent-scan",
+      "capture_kind": "calibrated-dslr-multiview",
+      "source_url": "https://www.eth3d.net/datasets",
+      "license_status": "CC-BY-NC-SA-4.0",
+      "unit_ids": [
+        "delivery_area",
+        "kicker",
+        "office",
+        "pipes",
+        "relief",
+        "relief_2",
+        "terrains"
+      ]
+    },
+    "tanks-and-temples-training": {
+      "track": "scene",
+      "gt_tier": "G0-independent-scan",
+      "capture_kind": "raw-4k-video",
+      "source_url": "https://www.tanksandtemples.org/download/",
+      "license_status": "source-terms-apply",
+      "unit_ids": ["Meetingroom"],
+      "official_checksums": {
+        "Meetingroom.mp4_md5": "5beeb4e21ca5b8fda31235cf15972393",
+        "Meetingroom.zip_md5": "754932b99adcfc602908c5bda917c5a3"
+      }
+    },
+    "seven-scenes": {
+      "track": "scene",
+      "gt_tier": "G1-fusion-reference",
+      "capture_kind": "handheld-rgbd-stream",
+      "source_url": "https://www.microsoft.com/en-us/research/project/rgb-d-dataset-7-scenes/",
+      "license_status": "non-commercial",
+      "unit_ids": ["chess", "fire", "heads", "office", "pumpkin", "redkitchen", "stairs"]
+    },
+    "redwood-reconstruction": {
+      "track": "scene",
+      "gt_tier": "G2-synthetic-exact",
+      "capture_kind": "synthetic-rgbd-trajectory",
+      "source_url": "https://redwood-data.org/indoor/dataset.html",
+      "license_status": "source-terms-apply",
+      "unit_ids": ["livingroom", "office"],
+      "primary_trajectory": 1,
+      "secondary_trajectory": 2
+    },
+    "dtu-mvs": {
+      "track": "instance",
+      "gt_tier": "O0-instance-scan",
+      "capture_kind": "calibrated-object-multiview",
+      "source_url": "https://roboimagedata.compute.dtu.dk/?page_id=36",
+      "input_mirror": "https://github.com/YoYo000/MVSNet",
+      "license_status": "source-terms-apply",
+      "unit_ids": [
+        "scan1",
+        "scan4",
+        "scan9",
+        "scan10",
+        "scan11",
+        "scan12",
+        "scan13",
+        "scan15",
+        "scan23",
+        "scan24",
+        "scan29",
+        "scan32",
+        "scan33",
+        "scan34",
+        "scan48"
+      ]
+    },
+    "omniobject3d": {
+      "track": "instance",
+      "gt_tier": "O0-instance-scan",
+      "capture_kind": "real-object-video-and-scan",
+      "source_url": "https://openxlab.org.cn/datasets/OpenXDLab/OmniObject3D-New/explore/main",
+      "license_status": "CC-BY-4.0",
+      "access": "requires-openxlab-login-and-ak-sk",
+      "selection_status": "requested-semantic-slots-unresolved-until-authorized-metadata-is-available",
+      "unit_ids": [
+        "apple_001",
+        "apple_002",
+        "backpack_001",
+        "backpack_002",
+        "book_001",
+        "book_002",
+        "bottle_045",
+        "bottle_046",
+        "bowl_001",
+        "bowl_002",
+        "chair_001",
+        "chair_002",
+        "cup_001",
+        "cup_002",
+        "laptop_001",
+        "laptop_002",
+        "shoe_001",
+        "shoe_002",
+        "table_001",
+        "table_002",
+        "teapot_001",
+        "teapot_002",
+        "vase_001",
+        "vase_002"
+      ]
+    }
+  },
+  "evaluation_protocol": {
+    "geometry_scope": "raw-global",
+    "mesh_sampling": "triangle-area-weighted-uniform",
+    "prediction_samples": 200000,
+    "max_reference_samples": 1000000,
+    "distance_summaries": ["mean", "median", "p90", "p95"],
+    "absolute_fscore_thresholds_m": [0.02, 0.05, 0.1],
+    "instance_fscore_thresholds_bbox_diagonal": [0.005, 0.01, 0.02],
+    "normal_correspondence_max_distance_m": 0.2,
+    "normal_metric_policy": "null-when-reference-normals-are-unavailable",
+    "alignment_policy": "declared-dataset-frame-or-conditioning-camera-sim3",
+    "forbidden_primary_alignment": "gt-mesh-icp",
+    "main_geometry_order": ["fscore_at_0.05m", "chamfer_symmetric_mean_m", "normal_consistency"]
+  },
+  "aggregation_policy": {
+    "unit": "physical-scene-or-object",
+    "macro_average": true,
+    "micro_average": false,
+    "separate_gt_tiers": true,
+    "separate_scene_and_instance_tracks": true,
+    "missing_metrics": null
+  }
+}

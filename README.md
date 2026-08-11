@@ -224,6 +224,25 @@ reconstruction, and side-by-side H.264 review videos are documented in
 `outputs/internet-zero-shot/foundation-video-comparisons-v1/index.html` to review
 all 17 candidates.
 
+### Ground-truth calibration suite
+
+The frozen mixed-provenance calibration plan contains 76 scene/object units
+across ScanNet++, ETH3D, Tanks and Temples, 7-Scenes, Redwood, DTU, and
+OmniObject3D. Build and validate the locally available packages with:
+
+```sh
+.venv/bin/python tools/prepare_gt_calibration_datasets.py all
+.venv/bin/python tools/validate_gt_calibration_sources.py
+```
+
+The current local build has 51 complete calibration packages, one T&T unit
+blocked on the official Google Drive laser/alignment quota, and 24
+OmniObject3D request slots blocked on OpenXLab authentication. Twenty-two
+existing G0 predictions have been recomputed under the same strict 2/5/10 cm,
+raw-global geometry schema. GT tiers and scene/instance tracks are never merged
+into one score. See `reports/GT_CALIBRATION_V1_REPORT_zh.md` for the source
+checksums, exact metrics, limitations, and reproduction commands.
+
 ### GLB conversion
 Bake the reconstructed scene into a single textured `scene.glb`. This reads the
 `to_glb_inputs.pt` and `chunk_inputs.pt` written by `reconstruct_scene.py` into

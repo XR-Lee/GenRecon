@@ -8,6 +8,8 @@
 
 16 GiB low-VRAM 执行策略：512 场景在不超过 16 chunks 时保留单次联合解码；更大场景使用互斥的递归空间分区，并为每组外扩 16 个输入体素作为边界上下文。相机、采样、阈值和生成分辨率不变。
 
+> 指标兼容说明：本报告保留原始 `F-score 算术均值@0.1m = (Precision + Recall) / 2`。统一 GT suite 使用标准 harmonic F-score，同一 20 场景的 `F@10cm` 均值为 0.503604。两者不能混报；新结果见 `GT_CALIBRATION_V1_REPORT_zh.md`。
+
 显式分组解码覆盖仅用于初次重建发生 OOM 的场景，是确定性的资源回退（deterministic resource fallback），不改变相机、采样、阈值或生成分辨率。下表依据各场景 `outputs/<scene_id>/reconstruction/args.json` 中两个 `joint_decode_*` 字段的非空值自动生成。
 
 ## 初次 OOM 场景的分组解码回退
