@@ -29,6 +29,8 @@ from scipy.spatial import cKDTree
 
 DEFAULT_NUM_SAMPLES = 200_000
 DEFAULT_SEED = 42
+DEFAULT_THRESHOLDS_M = (0.02, 0.05, 0.10)
+DEFAULT_NORMALIZED_THRESHOLDS = (0.005, 0.01, 0.02)
 FSCORE_THRESHOLD_M = 0.1
 NORMAL_MAX_DISTANCE_M = 0.2
 PROTOCOL_UNCLIPPED = "paper-like-unclipped"
@@ -198,6 +200,40 @@ def _normal_consistency(
     return float(np.mean(values)), float(np.mean(within_cutoff))
 
 
+def _distance_summary(values: np.ndarray) -> dict[str, float]:
+    return {
+        "mean_m": float(np.mean(values)),
+        "median_m": float(np.median(values)),
+        "p90_m": float(np.quantile(values, 0.90)),
+        "p95_m": float(np.quantile(values, 0.95)),
+    }
+
+
+def _threshold_scores(
+    pred_to_gt_dist: np.ndarray,
+    gt_to_pred_dist: np.ndarray,
+    thresholds: tuple[float, ...],
+) -> dict[str, dict[str, float]]:
+    scores: dict[str, dict[str, float]] = {}
+    for threshold in thresholds:
+        if not math.isfinite(threshold) or threshold <= 0.0:
+            raise ValueError(f"Evaluation thresholds must be positive and finite: {threshold}")
+        precision = float(np.mean(pred_to_gt_dist <= threshold))
+        recall = float(np.mean(gt_to_pred_dist <= threshold))
+        harmonic = (
+            2.0 * precision * recall / (precision + recall)
+            if precision + recall > 0.0
+            else 0.0
+        )
+        scores[f"{threshold:.6f}"] = {
+            "threshold_m": float(threshold),
+            "precision": precision,
+            "recall": recall,
+            "fscore_harmonic": harmonic,
+        }
+    return scores
+
+
 def evaluate_meshes(
     predicted_mesh: trimesh.Trimesh | str | Path,
     ground_truth_mesh: trimesh.Trimesh | str | Path,
@@ -205,6 +241,8 @@ def evaluate_meshes(
     num_samples: int = DEFAULT_NUM_SAMPLES,
     seed: int = DEFAULT_SEED,
     gt_aabb_margin_m: float | None = None,
+    thresholds_m: tuple[float, ...] = DEFAULT_THRESHOLDS_M,
+    normalized_thresholds: tuple[float, ...] = DEFAULT_NORMALIZED_THRESHOLDS,
     workers: int = -1,
 ) -> dict[str, Any]:
     """Evaluate two meshes and return a JSON-serialisable result dictionary."""
@@ -213,6 +251,10 @@ def evaluate_meshes(
         raise ValueError(f"num_samples must be positive, got {num_samples}")
     if workers == 0 or workers < -1:
         raise ValueError("workers must be -1 or a positive integer")
+    thresholds_m = tuple(float(value) for value in thresholds_m)
+    normalized_thresholds = tuple(float(value) for value in normalized_thresholds)
+    if not thresholds_m:
+        raise ValueError("At least one absolute evaluation threshold is required")
 
     predicted = _as_single_mesh(predicted_mesh, label="predicted")
     ground_truth = _as_single_mesh(ground_truth_mesh, label="ground-truth")
@@ -267,8 +309,21 @@ def evaluate_meshes(
     pred_tree = cKDTree(pred_points)
     gt_to_pred_dist, gt_to_pred_index = pred_tree.query(gt_points, k=1, workers=workers)
 
-    pred_to_gt_mean = float(np.mean(pred_to_gt_dist))
-    gt_to_pred_mean = float(np.mean(gt_to_pred_dist))
+    pred_to_gt_summary = _distance_summary(pred_to_gt_dist)
+    gt_to_pred_summary = _distance_summary(gt_to_pred_dist)
+    pred_to_gt_mean = pred_to_gt_summary["mean_m"]
+    gt_to_pred_mean = gt_to_pred_summary["mean_m"]
+    threshold_scores = _threshold_scores(pred_to_gt_dist, gt_to_pred_dist, thresholds_m)
+    gt_diagonal_m = float(np.linalg.norm(ground_truth_bounds[1] - ground_truth_bounds[0]))
+    if not math.isfinite(gt_diagonal_m) or gt_diagonal_m <= 0.0:
+        raise MeshEvaluationError(f"Ground-truth mesh has invalid AABB diagonal {gt_diagonal_m}")
+    normalized_threshold_scores = _threshold_scores(
+        pred_to_gt_dist,
+        gt_to_pred_dist,
+        tuple(value * gt_diagonal_m for value in normalized_thresholds),
+    )
+    for ratio, score in zip(normalized_thresholds, normalized_threshold_scores.values()):
+        score["bbox_diagonal_fraction"] = float(ratio)
     precision = float(np.mean(pred_to_gt_dist <= FSCORE_THRESHOLD_M))
     recall = float(np.mean(gt_to_pred_dist <= FSCORE_THRESHOLD_M))
     arithmetic_fscore = 0.5 * (precision + recall)
@@ -304,7 +359,7 @@ def evaluate_meshes(
             "independent_rng_streams": True,
         },
         "thresholds_m": {
-            "precision_recall": FSCORE_THRESHOLD_M,
+            "precision_recall": list(thresholds_m),
             "normal_correspondence_max_distance": NORMAL_MAX_DISTANCE_M,
         },
         "crop": crop,
@@ -314,9 +369,14 @@ def evaluate_meshes(
             "ground_truth": ground_truth_summary,
         },
         "metrics": {
+            "pred_to_gt_m": pred_to_gt_summary,
+            "gt_to_pred_m": gt_to_pred_summary,
             "pred_to_gt_mean_m": pred_to_gt_mean,
             "gt_to_pred_mean_m": gt_to_pred_mean,
             "chamfer_symmetric_mean_m": 0.5 * (pred_to_gt_mean + gt_to_pred_mean),
+            "threshold_scores": threshold_scores,
+            "normalized_threshold_scores": normalized_threshold_scores,
+            "ground_truth_bbox_diagonal_m": gt_diagonal_m,
             "precision_at_0_1m": precision,
             "recall_at_0_1m": recall,
             "fscore_arithmetic_at_0_1m": arithmetic_fscore,
@@ -362,6 +422,20 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--thresholds-m",
+        type=float,
+        nargs="+",
+        default=list(DEFAULT_THRESHOLDS_M),
+        help="Absolute precision/recall thresholds in meters (default: 0.02 0.05 0.10).",
+    )
+    parser.add_argument(
+        "--normalized-thresholds",
+        type=float,
+        nargs="+",
+        default=list(DEFAULT_NORMALIZED_THRESHOLDS),
+        help="Thresholds as fractions of the GT AABB diagonal (default: 0.005 0.01 0.02).",
+    )
+    parser.add_argument(
         "--workers",
         type=int,
         default=-1,
@@ -380,6 +454,8 @@ def main(argv: list[str] | None = None) -> int:
             num_samples=args.num_samples,
             seed=args.seed,
             gt_aabb_margin_m=args.gt_aabb_margin,
+            thresholds_m=tuple(args.thresholds_m),
+            normalized_thresholds=tuple(args.normalized_thresholds),
             workers=args.workers,
         )
         output = json.dumps(result, indent=2, sort_keys=True, allow_nan=False) + "\n"

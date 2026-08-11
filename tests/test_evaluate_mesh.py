@@ -99,6 +99,31 @@ class EvaluateMeshTests(unittest.TestCase):
             metrics["fscore_harmonic_at_0_1m"],
         )
 
+    def test_multiple_absolute_and_normalized_thresholds_are_reported(self) -> None:
+        result = evaluate_meshes(
+            _unit_square(z=0.03),
+            _unit_square(),
+            num_samples=8_192,
+            seed=42,
+            workers=1,
+        )
+        scores = result["metrics"]["threshold_scores"]
+        self.assertLess(scores["0.020000"]["fscore_harmonic"], 0.01)
+        self.assertGreater(scores["0.050000"]["fscore_harmonic"], 0.99)
+        normalized = result["metrics"]["normalized_threshold_scores"]
+        self.assertEqual(sorted(normalized), ["0.007071", "0.014142", "0.028284"])
+        self.assertAlmostEqual(result["metrics"]["ground_truth_bbox_diagonal_m"], 2**0.5)
+
+    def test_invalid_threshold_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "positive and finite"):
+            evaluate_meshes(
+                _unit_square(),
+                _unit_square(),
+                num_samples=32,
+                thresholds_m=(0.0,),
+                workers=1,
+            )
+
     def test_empty_mesh_is_rejected(self) -> None:
         empty = trimesh.Trimesh(
             vertices=np.empty((0, 3), dtype=np.float64),
