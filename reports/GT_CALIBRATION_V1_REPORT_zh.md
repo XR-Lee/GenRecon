@@ -239,12 +239,14 @@ ETH3D 的 completeness 明显差于 ScanNet++，说明 full laser reference 中�
 - `tools/evaluate_gt_suite.py`：mesh/point-cloud 统一 canonical schema、按 tier/dataset/track 聚合和 bootstrap CI。
 - `tools/evaluate_mesh.py`：2/5/10 cm、distance quantiles、bbox-normalized thresholds 和严格 JSON。
 - `tools/evaluate_mesh_pointcloud.py`：同一多阈值 schema，并显式区分 legacy prediction-AABB 与 full-reference scope。
+- `tools/export_gt_calibration_videos.py`：固定代表场景、冻结 8+8 相机、RGB/reference/prediction 三栏 H.264 和 HTML 审查页。
+- `tools/validate_gt_calibration_videos.py`：逐帧、geometry provenance、SHA256、视频完整解码和 blocker 边界的独立 release validator。
 
 每个 `evaluation.json` 包含 prediction/reference/manifest SHA256、GT kind、alignment、ROI、scope、sampling、阈值、canonical metrics、backend 原始结果和 limitations。`summarize` 在只刷新 metadata 前重新核对 prediction/reference SHA256；几何输入变化时会直接失败，不会静默复用旧指标。
 
 验证结果：
 
-- 全仓库：`198 passed in 8.73s`；
+- 全仓库：`206 passed in 8.33s`；
 - 新增/修改 Python 文件全部通过 `py_compile`；
 - `configs/eval/gt_calibration_v1.json` 通过严格 JSON 解析；
 - `git diff --check` 无输出；
@@ -259,7 +261,7 @@ ETH3D 的 completeness 明显差于 ScanNet++，说明 full laser reference 中�
 4. 7-Scenes、Redwood、DTU 不是 G0 room-scale independent laser table，禁止与 G0 直接求总均值。
 5. ScanNet++ 可能参与过 GenRecon 训练，只能作 calibration，不证明 strict zero-shot。
 6. 当前 v1 已统一核心 3D geometry schema；observed/unobserved visibility、heldout full-GT-mask RGB/depth、chunk boundary 和 camera trajectory 仍需对应 prediction/render adapter 后单列，不能用空值伪装成已评测。
-7. 文件、hash 和 schema `pass` 不等于几何视觉正确；仍需逐场景渲染和人工检查。
+7. 已完成 6 个可用数据集代表的 96 个冻结相机 RGB/reference render 人工检查，并对 ScanNet++/ETH3D 增加真实 prediction render；T&T、7-Scenes、Redwood、DTU 仍是显式 `missing-prediction`，不得将 GT/reference 栏称为模型输出。详见 `reports/GT_CALIBRATION_VIDEO_VISUALIZATION_V1_REPORT_zh.md`。
 
 ## 9. 复现入口
 
@@ -274,6 +276,9 @@ PYTHONPATH=/tmp/pycolmap-wheel .venv/bin/python \
   --num-samples 200000 --max-gt-samples 1000000 --workers -1
 .venv/bin/python tools/evaluate_gt_suite.py summarize \
   --output-root reports/generated/gt-calibration-v1/evaluations
+EGL_PLATFORM=surfaceless .venv/bin/python \
+  tools/export_gt_calibration_videos.py all
+.venv/bin/python tools/validate_gt_calibration_videos.py
 ```
 
 关键产物：

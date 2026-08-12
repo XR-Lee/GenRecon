@@ -1,0 +1,67 @@
+{
+  "schema": "genrecon.gt-calibration-visualization-plan",
+  "schema_version": 1,
+  "seed": 42,
+  "render_width": 640,
+  "playback_fps": 2.0,
+  "reference_max_points": 2500000,
+  "point_size_px": 2.5,
+  "comparison_size": [1920, 720],
+  "datasets": [
+    {
+      "dataset": "da3-scannetpp",
+      "dataset_label": "ScanNet++",
+      "unit_id": "scannetpp-286b55a2bf",
+      "scene_label": "286b55a2bf",
+      "selection_reason": "Existing evaluated room-scale prediction with independent scan reference"
+    },
+    {
+      "dataset": "eth3d-indoor-training",
+      "dataset_label": "ETH3D",
+      "unit_id": "eth3d-delivery_area",
+      "scene_label": "delivery_area",
+      "selection_reason": "Existing evaluated room-scale prediction with aligned laser scans",
+      "prediction_render_cache": {
+        "render_manifest": "outputs/eth3d/delivery_area/fidelity_comparison/render_ply.json",
+        "views_root": "outputs/eth3d/delivery_area/fidelity_comparison/views",
+        "expected_prediction_sha256": "17328a06ec517340b05ce5565c8137cd5292f7be241bf580aff5898382d49c93"
+      }
+    },
+    {
+      "dataset": "tanks-and-temples-training",
+      "dataset_label": "Tanks and Temples",
+      "unit_id": "tanks-and-temples-meetingroom",
+      "scene_label": "Meetingroom",
+      "selection_reason": "Frozen video-derived package with official aligned laser reference"
+    },
+    {
+      "dataset": "seven-scenes",
+      "dataset_label": "7-Scenes",
+      "unit_id": "seven-scenes-chess",
+      "scene_label": "chess",
+      "selection_reason": "Canonical real RGB-D localization scene with fusion reference"
+    },
+    {
+      "dataset": "redwood-reconstruction",
+      "dataset_label": "Redwood",
+      "unit_id": "redwood-livingroom",
+      "scene_label": "livingroom",
+      "selection_reason": "Representative synthetic room trajectory with exact point geometry"
+    },
+    {
+      "dataset": "dtu-mvs",
+      "dataset_label": "DTU MVS",
+      "unit_id": "dtu-scan24",
+      "scene_label": "scan24",
+      "selection_reason": "Representative calibrated object-scale structured-light scene"
+    },
+    {
+      "dataset": "omniobject3d",
+      "dataset_label": "OmniObject3D",
+      "unit_id": "omniobject3d-bottle_045",
+      "scene_label": "requested bottle slot",
+      "selection_reason": "Authentication blocker representative; semantic slot is not an official object ID",
+      "expected_status": "blocked-auth"
+    }
+  ]
+}

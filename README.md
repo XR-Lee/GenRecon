@@ -247,6 +247,25 @@ raw-global geometry schema. GT tiers and scene/instance tracks are never merged
 into one score. See `reports/GT_CALIBRATION_V1_REPORT_zh.md` for the source
 checksums, exact metrics, limitations, and reproduction commands.
 
+Representative same-camera review videos are available locally at
+`outputs/gt-calibration-v1/visualizations-v1/index.html`. Each prepared scene
+shows frozen reference RGB beside evaluation-only GT/reference geometry. The
+third panel contains a real GenRecon prediction only when the registry already
+has one; otherwise it is an explicit `missing-prediction` status card. Build
+and release-validate the review set with:
+
+```sh
+EGL_PLATFORM=surfaceless .venv/bin/python \
+  tools/export_gt_calibration_videos.py all
+.venv/bin/python tools/validate_gt_calibration_videos.py
+```
+
+The current review has six source/reference representatives, two actual
+GenRecon prediction renders, four explicit missing-prediction panels, and one
+OmniObject3D authentication blocker. See
+`reports/GT_CALIBRATION_VIDEO_VISUALIZATION_V1_REPORT_zh.md` for the per-dataset
+selection, provenance boundaries, hashes, and validation counts.
+
 ### GLB conversion
 Bake the reconstructed scene into a single textured `scene.glb`. This reads the
 `to_glb_inputs.pt` and `chunk_inputs.pt` written by `reconstruct_scene.py` into
