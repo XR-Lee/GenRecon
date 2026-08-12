@@ -1417,6 +1417,307 @@ def prepare_omni_blockers(plan: dict[str, Any], output: Path) -> list[dict[str, 
     return rows
 
 
+def _sha256_string(value: Any) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def _conditioning_manifest_contract_sha256(document: dict[str, Any]) -> str:
+    canonical = {
+        key: value
+        for key, value in document.items()
+        if key not in {"prediction_mesh", "prediction_provenance"}
+    }
+    payload = json.dumps(
+        canonical,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _root_recorded_path(value: str) -> Path:
+    path = Path(value)
+    return path.resolve() if path.is_absolute() else (ROOT / path).resolve()
+
+
+def _validate_representative_input_sources(
+    document: dict[str, Any], manifest_path: Path, unit_id: str
+) -> None:
+    try:
+        if (
+            document.get("schema") != "genrecon.gt-representative-foundation-input"
+            or document.get("schema_version") != 1
+            or document.get("unit_id") != unit_id
+            or document.get("track") != "GT-pose-foundation-pseudo-geometry"
+        ):
+            raise CalibrationBuildError("unexpected representative input schema")
+
+        audit = document.get("source_audit", {})
+        records = audit.get("source_files_read")
+        expected_roles = [
+            "unit-manifest",
+            "conditioning-camera-metadata",
+            *("conditioning-rgb" for _ in range(8)),
+        ]
+        if (
+            not isinstance(records, list)
+            or [record.get("role") for record in records] != expected_roles
+            or audit.get("heldout_rgb_paths_read") != []
+            or audit.get("depth_paths_read") != []
+            or audit.get("reference_paths_read") != []
+            or audit.get("conditioning_camera_records_used") != 8
+            or audit.get("heldout_camera_records_used") != 0
+        ):
+            raise CalibrationBuildError("source audit is not conditioning-only 1+1+8")
+
+        source_manifest = _root_recorded_path(document["source_manifest"])
+        if _root_recorded_path(records[0]["path"]) != source_manifest:
+            raise CalibrationBuildError("source manifest path differs from audit")
+        source_document = load_json(source_manifest)
+        if source_document.get("unit_id") != unit_id or source_document.get("status") != "prepared":
+            raise CalibrationBuildError("source unit manifest is not the prepared unit")
+        conditioning_contract = _conditioning_manifest_contract_sha256(source_document)
+        if (
+            document.get("source_manifest_conditioning_contract_sha256")
+            != conditioning_contract
+            or records[0].get("conditioning_contract_sha256") != conditioning_contract
+        ):
+            raise CalibrationBuildError("conditioning manifest contract changed")
+
+        source_root = source_manifest.parent
+        expected_camera = (source_root / source_document["input"]["cameras"]).resolve()
+        expected_rgb = [
+            (source_root / value).resolve()
+            for value in source_document["input"]["conditioning_views"]
+        ]
+        if len(expected_rgb) != 8 or len(set(expected_rgb)) != 8:
+            raise CalibrationBuildError("conditioning split is not 8 unique RGBs")
+        recorded_paths = [_root_recorded_path(record["path"]) for record in records]
+        if recorded_paths[1:] != [expected_camera, *expected_rgb]:
+            raise CalibrationBuildError("audited paths differ from conditioning split")
+        for record, path in zip(records[1:], recorded_paths[1:]):
+            if (
+                not path.is_file()
+                or path.stat().st_size != record.get("size_bytes_at_read")
+                or sha256_file(path) != record.get("sha256_at_read")
+            ):
+                raise CalibrationBuildError(f"audited conditioning source changed: {path}")
+
+        expected_assets = [
+            "colmap_vggt/cameras.txt",
+            "colmap_vggt/images.txt",
+            "colmap_vggt/points3D.txt",
+            *(f"rgb/{index:03d}.png" for index in range(8)),
+        ]
+        assets = document.get("genrecon_input_assets")
+        if (
+            not isinstance(assets, list)
+            or [record.get("path") for record in assets] != expected_assets
+        ):
+            raise CalibrationBuildError("GenRecon input asset contract is missing or unordered")
+        for record in assets:
+            path = (manifest_path.parent / record["path"]).resolve()
+            if (
+                not path.is_file()
+                or path.stat().st_size != record.get("size_bytes")
+                or sha256_file(path) != record.get("sha256")
+            ):
+                raise CalibrationBuildError(f"GenRecon input asset changed: {path}")
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise CalibrationBuildError(f"invalid representative input sources: {exc}") from exc
+
+
+def _representative_input_contract_sha256(document: dict[str, Any]) -> str:
+    canonical = json.loads(json.dumps(document, allow_nan=False))
+    canonical.pop("source_manifest_sha256_at_read", None)
+    inference = canonical.get("inference", {})
+    inference.pop("elapsed_seconds", None)
+    inference.pop("peak_memory_mib", None)
+    model = canonical.get("model", {})
+    model.pop("checkpoint_path", None)
+    for record in canonical.get("source_audit", {}).get("source_files_read", []):
+        if record.get("role") == "unit-manifest":
+            record.pop("size_bytes_at_read", None)
+            record.pop("sha256_at_read", None)
+    payload = json.dumps(
+        canonical,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def validate_prediction_override(
+    plan: dict[str, Any], unit_id: str
+) -> dict[str, Any] | None:
+    override = plan.get("prediction_overrides", {}).get(unit_id)
+    if override is None:
+        return None
+    mesh = (ROOT / override["mesh"]).resolve()
+    package_manifest = (ROOT / override["package_manifest"]).resolve()
+    existing = [path.is_file() for path in (mesh, package_manifest)]
+    if not any(existing):
+        return None
+    if not all(existing):
+        raise CalibrationBuildError(
+            f"Incomplete prediction override for {unit_id}: {mesh}, {package_manifest}"
+        )
+    package = load_json(package_manifest)
+    expected_track = override["track"]
+    alignment = package.get("alignment", {})
+    matrix = np.asarray(alignment.get("work_to_official", []), dtype=np.float64)
+    outputs = package.get("outputs", {})
+    mesh_output = outputs.get("mesh", {})
+    glb_output = outputs.get("glb", {})
+    declared_mesh = (package_manifest.parent / mesh_output.get("path", "")).resolve()
+    glb = (package_manifest.parent / glb_output.get("path", "")).resolve()
+    source = package.get("source", {})
+    source_hashes = source.get("sha256", {})
+    reconstruction_value = source.get("reconstruction")
+    input_manifest_value = source.get("input_manifest")
+    reconstruction = (
+        (ROOT / reconstruction_value).resolve()
+        if isinstance(reconstruction_value, str)
+        else None
+    )
+    input_manifest = (
+        (ROOT / input_manifest_value).resolve()
+        if isinstance(input_manifest_value, str)
+        else None
+    )
+    input_document = (
+        load_json(input_manifest)
+        if input_manifest is not None and input_manifest.is_file()
+        else None
+    )
+    input_matrix = np.asarray(
+        (
+            input_document.get("work_frame", {}).get("work_to_official", [])
+            if input_document is not None
+            else []
+        ),
+        dtype=np.float64,
+    )
+    source_mesh = reconstruction / "mesh.ply" if reconstruction is not None else None
+    source_glb = reconstruction / "scene.glb" if reconstruction is not None else None
+    input_contract = source.get("input_manifest_contract_sha256")
+    if input_document is not None:
+        _validate_representative_input_sources(input_document, input_manifest, unit_id)
+    if (
+        package.get("schema") != "genrecon.gt-representative-prediction-package"
+        or package.get("schema_version") != 1
+        or package.get("status") != "pass"
+        or package.get("unit_id") != unit_id
+        or package.get("track") != expected_track
+        or package.get("coordinate_frame") != "declared calibration/reference frame"
+        or matrix.shape != (4, 4)
+        or not np.isfinite(matrix).all()
+        or not np.allclose(matrix[3], [0.0, 0.0, 0.0, 1.0], atol=1e-8)
+        or alignment.get("gt_geometry_icp_used") is not False
+        or alignment.get("reference_geometry_used") is not False
+        or alignment.get("heldout_views_used") is not False
+        or alignment.get("method")
+        != "conditioning-camera-only Sim(3), followed by exact work-to-official inverse"
+        or declared_mesh != mesh
+        or declared_mesh.parent != package_manifest.parent
+        or glb.parent != package_manifest.parent
+        or not glb.is_file()
+        or mesh_output.get("size_bytes") != mesh.stat().st_size
+        or mesh_output.get("sha256") != sha256_file(mesh)
+        or glb_output.get("size_bytes") != glb.stat().st_size
+        or glb_output.get("sha256") != sha256_file(glb)
+        or source_mesh is None
+        or source_glb is None
+        or reconstruction != (package_manifest.parent.parent / "reconstruction").resolve()
+        or not source_mesh.is_file()
+        or not source_glb.is_file()
+        or source_hashes.get("mesh") != sha256_file(source_mesh)
+        or source_hashes.get("glb") != sha256_file(source_glb)
+        or input_manifest is None
+        or input_document is None
+        or input_document.get("unit_id") != unit_id
+        or input_matrix.shape != (4, 4)
+        or not np.array_equal(matrix, input_matrix)
+        or not _sha256_string(input_contract)
+        or input_contract
+        != _representative_input_contract_sha256(input_document)
+    ):
+        raise CalibrationBuildError(f"Invalid prediction override contract for {unit_id}")
+    return {
+        "mesh": mesh,
+        "mesh_sha256": mesh_output["sha256"],
+        "mesh_size_bytes": mesh_output["size_bytes"],
+        "glb": glb,
+        "glb_sha256": glb_output["sha256"],
+        "glb_size_bytes": glb_output["size_bytes"],
+        "input_manifest_contract_sha256": input_contract,
+        "package_manifest": package_manifest,
+        "package_manifest_sha256": sha256_file(package_manifest),
+        "track": expected_track,
+        "alignment": alignment.get("method"),
+    }
+
+
+def register_prediction_overrides(
+    plan_path: Path, plan: dict[str, Any], output: Path
+) -> dict[str, Any]:
+    registry_path = output / "registry.json"
+    if not registry_path.is_file():
+        raise CalibrationBuildError(f"GT registry does not exist: {registry_path}")
+    registry = load_json(registry_path)
+    rows = registry.get("units", [])
+    by_id = {row["unit_id"]: row for row in rows}
+    unknown = sorted(set(plan.get("prediction_overrides", {})) - set(by_id))
+    if unknown:
+        raise CalibrationBuildError(f"Prediction overrides reference unknown units: {unknown}")
+    registered = 0
+    for unit_id in sorted(plan.get("prediction_overrides", {})):
+        row = by_id[unit_id]
+        manifest_path = output / row["manifest"]
+        manifest = load_json(manifest_path)
+        prediction = validate_prediction_override(plan, unit_id)
+        if prediction is None:
+            row["prediction_mesh"] = None
+            manifest["prediction_mesh"] = None
+            manifest.pop("prediction_provenance", None)
+        else:
+            prediction_value = relpath(prediction["mesh"], output)
+            row["prediction_mesh"] = prediction_value
+            manifest["prediction_mesh"] = prediction_value
+            manifest["prediction_provenance"] = {
+                "track": prediction["track"],
+                "alignment": prediction["alignment"],
+                "package_manifest": relpath(
+                    prediction["package_manifest"], manifest_path.parent
+                ),
+                "package_manifest_sha256": prediction["package_manifest_sha256"],
+                "mesh_sha256": prediction["mesh_sha256"],
+                "mesh_size_bytes": prediction["mesh_size_bytes"],
+                "glb": relpath(prediction["glb"], manifest_path.parent),
+                "glb_sha256": prediction["glb_sha256"],
+                "glb_size_bytes": prediction["glb_size_bytes"],
+                "input_manifest_contract_sha256": prediction[
+                    "input_manifest_contract_sha256"
+                ],
+                "reference_geometry_used_for_conditioning": False,
+                "heldout_views_used_for_conditioning": False,
+                "gt_geometry_icp_used": False,
+            }
+            registered += 1
+        write_json(manifest_path, manifest)
+    rebuilt = build_registry(plan_path, output, rows)
+    write_summary(output, rebuilt)
+    print(
+        f"[gt-prediction-registration] registered={registered}/"
+        f"{len(plan.get('prediction_overrides', {}))}"
+    )
+    return rebuilt
+
+
 def build_registry(plan_path: Path, output: Path, rows: list[dict[str, Any]]) -> dict[str, Any]:
     document = {
         "schema": REGISTRY_SCHEMA,
@@ -1516,6 +1817,51 @@ def validate(output: Path, plan: dict[str, Any]) -> dict[str, Any]:
             errors.append(f"missing manifest {manifest_path}")
             continue
         manifest = load_json(manifest_path)
+        if row["unit_id"] in plan.get("prediction_overrides", {}):
+            try:
+                expected_prediction = validate_prediction_override(plan, row["unit_id"])
+                expected_value = (
+                    relpath(expected_prediction["mesh"], output)
+                    if expected_prediction is not None
+                    else None
+                )
+                if row.get("prediction_mesh") != expected_value:
+                    raise CalibrationBuildError("registry prediction override is stale")
+                if manifest.get("prediction_mesh") != expected_value:
+                    raise CalibrationBuildError("unit manifest prediction override is stale")
+                provenance = manifest.get("prediction_provenance")
+                if expected_prediction is None:
+                    if provenance is not None:
+                        raise CalibrationBuildError(
+                            "missing prediction retains prediction provenance"
+                        )
+                elif (
+                    not isinstance(provenance, dict)
+                    or provenance.get("track") != expected_prediction["track"]
+                    or provenance.get("package_manifest_sha256")
+                    != expected_prediction["package_manifest_sha256"]
+                    or provenance.get("mesh_sha256")
+                    != expected_prediction["mesh_sha256"]
+                    or provenance.get("mesh_size_bytes")
+                    != expected_prediction["mesh_size_bytes"]
+                    or provenance.get("glb")
+                    != relpath(expected_prediction["glb"], manifest_path.parent)
+                    or provenance.get("glb_sha256")
+                    != expected_prediction["glb_sha256"]
+                    or provenance.get("glb_size_bytes")
+                    != expected_prediction["glb_size_bytes"]
+                    or provenance.get("input_manifest_contract_sha256")
+                    != expected_prediction["input_manifest_contract_sha256"]
+                    or provenance.get("reference_geometry_used_for_conditioning")
+                    is not False
+                    or provenance.get("heldout_views_used_for_conditioning") is not False
+                    or provenance.get("gt_geometry_icp_used") is not False
+                ):
+                    raise CalibrationBuildError("prediction provenance contract mismatch")
+            except Exception as exc:
+                errors.append(
+                    f"invalid prediction override for {row['unit_id']}: {exc}"
+                )
         if manifest.get("schema") != SCHEMA:
             errors.append(f"manifest schema mismatch for {row['unit_id']}")
         for key in ("unit_id", "dataset", "track", "gt_tier", "physical_scene_group"):
@@ -1704,7 +2050,10 @@ def validate(output: Path, plan: dict[str, Any]) -> dict[str, Any]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("stage", choices=("prepare", "summarize", "validate", "all"))
+    parser.add_argument(
+        "stage",
+        choices=("prepare", "register-predictions", "summarize", "validate", "all"),
+    )
     parser.add_argument("--plan", type=Path, default=DEFAULT_PLAN)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--dataset", action="append", default=[])
@@ -1751,6 +2100,9 @@ def main() -> int:
             rows.extend(row for row in existing if row["dataset"] not in replaced)
         registry = build_registry(plan_path, output, rows)
         write_summary(output, registry)
+        register_prediction_overrides(plan_path, plan, output)
+    if args.stage == "register-predictions":
+        register_prediction_overrides(plan_path, plan, output)
     if args.stage == "summarize":
         registry = load_json(output / "registry.json")
         write_summary(output, registry)

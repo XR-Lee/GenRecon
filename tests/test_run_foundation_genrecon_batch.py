@@ -10,6 +10,7 @@ from tools.run_foundation_genrecon_batch import (
     parse_mesh_ply,
     reconstruct_command,
     selected_candidates,
+    validate_outputs,
 )
 
 
@@ -123,6 +124,31 @@ class FoundationGenreconBatchTests(unittest.TestCase):
         }
         selected = selected_candidates(index, [])
         self.assertEqual([item["candidate_id"] for item in selected], ["pilot", "reject"])
+
+    def test_summary_and_validation_are_deterministic(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            input_root = root / "input"
+            output_root = root / "output"
+            report_root = root / "report"
+            output_root.mkdir(parents=True)
+
+            first = validate_outputs(
+                [], input_root, output_root, report_root, "deterministic-test"
+            )
+            first_index = (output_root / "index.json").read_bytes()
+            first_validation = (output_root / "validation.json").read_bytes()
+            second = validate_outputs(
+                [], input_root, output_root, report_root, "deterministic-test"
+            )
+
+            self.assertNotIn("created_utc", json.loads(first_index))
+            self.assertNotIn("validated_utc", first)
+            self.assertEqual(first, second)
+            self.assertEqual(first_index, (output_root / "index.json").read_bytes())
+            self.assertEqual(
+                first_validation, (output_root / "validation.json").read_bytes()
+            )
 
 
 if __name__ == "__main__":

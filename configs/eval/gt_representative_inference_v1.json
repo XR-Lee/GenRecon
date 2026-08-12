@@ -1,0 +1,41 @@
+{
+  "schema": "genrecon.gt-representative-inference-plan",
+  "schema_version": 1,
+  "unit_ids": [
+    "tanks-and-temples-meetingroom",
+    "seven-scenes-chess",
+    "redwood-livingroom",
+    "dtu-scan24"
+  ],
+  "protocol": {
+    "seed": 42,
+    "conditioning_views": 8,
+    "geometry_source": "VGGT-1B from conditioning RGB only",
+    "camera_alignment": "Umeyama Sim(3) from conditioning camera centers only",
+    "work_frame": "metric z-up derived from conditioning cameras and pseudo points",
+    "heldout_rgb_used": false,
+    "conditioning_depth_used": false,
+    "heldout_depth_used": false,
+    "reference_geometry_used": false,
+    "gt_geometry_icp_used": false,
+    "confidence_percentile": 70.0,
+    "relative_depth_tolerance": 0.15,
+    "minimum_support": 1,
+    "prefilter_budget": 250000,
+    "maximum_points": 100000,
+    "minimum_cross_view_verified_fraction": 0.1,
+    "low_overlap_max_opportunity_fraction": 0.05,
+    "low_overlap_minimum_verified_points": 1000,
+    "low_overlap_minimum_verified_fraction_given_overlap": 0.5,
+    "minimum_official_camera_visible_fraction": 0.5,
+    "max_center_error_p90_baseline": 0.25,
+    "max_rotation_error_p90_deg": 35.0,
+    "genrecon_views": 8,
+    "required_preflight_fallbacks": 0,
+    "prediction_coordinate_frame": "declared calibration/reference frame",
+    "glb_texture_size": 4096,
+    "glb_simplify_threshold_per_chunk": 300000
+  },
+  "prediction_root": "outputs/gt-calibration-v1/representative-genrecon-v1",
+  "input_root": "data/gt-calibration-v1/genrecon-inputs-v1"
+}

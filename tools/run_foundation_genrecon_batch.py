@@ -439,7 +439,6 @@ def write_summary(
     summary = {
         "schema": f"genrecon.{track_name}-genrecon-index",
         "schema_version": 1,
-        "created_utc": utc_now(),
         "track": track_name,
         "source_index": input_root / "index.json",
         "source_foundation_index": input_root / "index.json",
@@ -546,8 +545,14 @@ def validate_outputs(
                 f"nonempty chunks {expected_nonempty_chunks}"
             )
     strict_json_files = 0
+    excluded_validation_paths = {
+        (output_root / "validation.json").resolve(),
+        (output_root / "inference_validation.json").resolve(),
+    }
     for root in (output_root, report_root):
         for path in root.rglob("*.json"):
+            if path.resolve() in excluded_validation_paths:
+                continue
             try:
                 load_json(path)
                 strict_json_files += 1
@@ -557,7 +562,6 @@ def validate_outputs(
         "schema": f"genrecon.{track_name}-genrecon-validation",
         "track": track_name,
         "schema_version": 1,
-        "validated_utc": utc_now(),
         "result": "pass" if not errors else "fail",
         "counts": {
             **summary["summary"],

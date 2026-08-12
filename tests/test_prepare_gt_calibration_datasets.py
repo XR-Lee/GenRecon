@@ -4,11 +4,13 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 from zipfile import ZipFile
 
 import numpy as np
 import trimesh
 
+import tools.prepare_gt_calibration_datasets as gt_builder
 from tools.prepare_gt_calibration_datasets import (
     CalibrationBuildError,
     _backproject_depth,
@@ -23,6 +25,7 @@ from tools.prepare_gt_calibration_datasets import (
     sha256_file,
     uniform_indices,
     validate,
+    validate_prediction_override,
     write_json,
 )
 
@@ -177,6 +180,206 @@ intrinsic
         self.assertEqual(first["stats"]["exported_points"], 3)
         self.assertEqual(first_hash, second["output"]["sha256"])
         self.assertEqual(len(loaded.vertices), 3)
+
+    def test_prediction_override_requires_complete_audited_package(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            candidate = root / "outputs" / "unit-a"
+            package_dir = candidate / "prediction_official"
+            mesh = package_dir / "mesh.ply"
+            glb = package_dir / "scene.glb"
+            package = package_dir / "manifest.json"
+            reconstruction = candidate / "reconstruction"
+            source_mesh = reconstruction / "mesh.ply"
+            source_glb = reconstruction / "scene.glb"
+            input_manifest = root / "inputs" / "unit-a" / "manifest.json"
+            plan = {
+                "prediction_overrides": {
+                    "unit-a": {
+                        "mesh": "outputs/unit-a/prediction_official/mesh.ply",
+                        "package_manifest": "outputs/unit-a/prediction_official/manifest.json",
+                        "track": "GT-pose-foundation-pseudo-geometry",
+                    }
+                }
+            }
+            with patch.object(gt_builder, "ROOT", root):
+                self.assertIsNone(validate_prediction_override(plan, "unit-a"))
+                mesh.parent.mkdir(parents=True)
+                mesh.write_bytes(b"mesh")
+                with self.assertRaisesRegex(CalibrationBuildError, "Incomplete prediction"):
+                    validate_prediction_override(plan, "unit-a")
+                glb.write_bytes(b"glTF")
+                reconstruction.mkdir(parents=True)
+                source_mesh.write_bytes(b"source-mesh")
+                source_glb.write_bytes(b"source-glb")
+                input_manifest.parent.mkdir(parents=True)
+                unit_dir = root / "units" / "unit-a"
+                camera = unit_dir / "cameras.json"
+                rgb_paths = [
+                    unit_dir / "rgb" / "conditioning" / f"{index:03d}.png"
+                    for index in range(8)
+                ]
+                camera.parent.mkdir(parents=True)
+                camera.write_bytes(b"camera-metadata")
+                for index, path in enumerate(rgb_paths):
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(f"conditioning-rgb-{index}".encode())
+                unit_manifest = unit_dir / "manifest.json"
+                unit_document = {
+                    "unit_id": "unit-a",
+                    "status": "prepared",
+                    "input": {
+                        "cameras": "cameras.json",
+                        "conditioning_views": [
+                            str(path.relative_to(unit_dir)) for path in rgb_paths
+                        ],
+                    },
+                }
+                write_json(unit_manifest, unit_document)
+                conditioning_contract = gt_builder._conditioning_manifest_contract_sha256(
+                    unit_document
+                )
+                source_records = [
+                    {
+                        "path": str(unit_manifest.relative_to(root)),
+                        "role": "unit-manifest",
+                        "size_bytes_at_read": unit_manifest.stat().st_size,
+                        "sha256_at_read": sha256_file(unit_manifest),
+                        "conditioning_contract_sha256": conditioning_contract,
+                    },
+                    {
+                        "path": str(camera.relative_to(root)),
+                        "role": "conditioning-camera-metadata",
+                        "size_bytes_at_read": camera.stat().st_size,
+                        "sha256_at_read": sha256_file(camera),
+                    },
+                    *[
+                        {
+                            "path": str(path.relative_to(root)),
+                            "role": "conditioning-rgb",
+                            "size_bytes_at_read": path.stat().st_size,
+                            "sha256_at_read": sha256_file(path),
+                        }
+                        for path in rgb_paths
+                    ],
+                ]
+                asset_names = [
+                    "colmap_vggt/cameras.txt",
+                    "colmap_vggt/images.txt",
+                    "colmap_vggt/points3D.txt",
+                    *(f"rgb/{index:03d}.png" for index in range(8)),
+                ]
+                asset_records = []
+                for name in asset_names:
+                    path = input_manifest.parent / name
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(name.encode())
+                    asset_records.append(
+                        {
+                            "path": name,
+                            "size_bytes": path.stat().st_size,
+                            "sha256": sha256_file(path),
+                        }
+                    )
+                input_document = {
+                    "schema": "genrecon.gt-representative-foundation-input",
+                    "schema_version": 1,
+                    "unit_id": "unit-a",
+                    "track": "GT-pose-foundation-pseudo-geometry",
+                    "source_manifest": str(unit_manifest.relative_to(root)),
+                    "source_manifest_conditioning_contract_sha256": conditioning_contract,
+                    "source_audit": {
+                        "source_files_read": source_records,
+                        "heldout_rgb_paths_read": [],
+                        "depth_paths_read": [],
+                        "reference_paths_read": [],
+                        "conditioning_camera_records_used": 8,
+                        "heldout_camera_records_used": 0,
+                    },
+                    "genrecon_input_assets": asset_records,
+                    "inference": {"input_views": 8, "elapsed_seconds": 1.0},
+                    "work_frame": {"work_to_official": np.eye(4).tolist()},
+                }
+                write_json(input_manifest, input_document)
+                input_contract = gt_builder._representative_input_contract_sha256(
+                    input_document
+                )
+                write_json(
+                    package,
+                    {
+                        "schema": "genrecon.gt-representative-prediction-package",
+                        "schema_version": 1,
+                        "status": "pass",
+                        "unit_id": "unit-a",
+                        "track": "GT-pose-foundation-pseudo-geometry",
+                        "coordinate_frame": "declared calibration/reference frame",
+                        "alignment": {
+                            "method": "conditioning-camera-only Sim(3), followed by exact work-to-official inverse",
+                            "work_to_official": np.eye(4).tolist(),
+                            "gt_geometry_icp_used": False,
+                            "reference_geometry_used": False,
+                            "heldout_views_used": False,
+                        },
+                        "source": {
+                            "reconstruction": str(reconstruction.relative_to(root)),
+                            "sha256": {
+                                "mesh": sha256_file(source_mesh),
+                                "glb": sha256_file(source_glb),
+                            },
+                            "input_manifest": str(input_manifest.relative_to(root)),
+                            "input_manifest_contract_sha256": input_contract,
+                        },
+                        "outputs": {
+                            "mesh": {
+                                "path": "mesh.ply",
+                                "size_bytes": mesh.stat().st_size,
+                                "sha256": sha256_file(mesh),
+                            },
+                            "glb": {
+                                "path": "scene.glb",
+                                "size_bytes": glb.stat().st_size,
+                                "sha256": sha256_file(glb),
+                            },
+                        },
+                    },
+                )
+                result = validate_prediction_override(plan, "unit-a")
+                self.assertEqual(result["mesh"], mesh)
+                self.assertEqual(result["glb"], glb)
+                self.assertEqual(result["track"], "GT-pose-foundation-pseudo-geometry")
+                glb.write_bytes(b"changed")
+                with self.assertRaisesRegex(CalibrationBuildError, "Invalid prediction"):
+                    validate_prediction_override(plan, "unit-a")
+                glb.write_bytes(b"glTF")
+                source_glb.write_bytes(b"changed-source")
+                with self.assertRaisesRegex(CalibrationBuildError, "Invalid prediction"):
+                    validate_prediction_override(plan, "unit-a")
+                source_glb.write_bytes(b"source-glb")
+                points = input_manifest.parent / "colmap_vggt" / "points3D.txt"
+                original_points = points.read_bytes()
+                points.write_bytes(b"changed-points3D")
+                gt_builder._HASH_CACHE.clear()
+                with self.assertRaisesRegex(CalibrationBuildError, "GenRecon input asset changed"):
+                    validate_prediction_override(plan, "unit-a")
+                points.write_bytes(original_points)
+                camera.write_bytes(b"changed-camera-metadata")
+                gt_builder._HASH_CACHE.clear()
+                with self.assertRaisesRegex(
+                    CalibrationBuildError, "audited conditioning source changed"
+                ):
+                    validate_prediction_override(plan, "unit-a")
+                camera.write_bytes(b"camera-metadata")
+                gt_builder._HASH_CACHE.clear()
+                document = json.loads(package.read_text())
+                document["alignment"]["work_to_official"][0][3] = 1.0
+                write_json(package, document)
+                with self.assertRaisesRegex(CalibrationBuildError, "Invalid prediction"):
+                    validate_prediction_override(plan, "unit-a")
+                document["alignment"]["work_to_official"] = np.eye(4).tolist()
+                document["alignment"]["reference_geometry_used"] = True
+                write_json(package, document)
+                with self.assertRaisesRegex(CalibrationBuildError, "Invalid prediction"):
+                    validate_prediction_override(plan, "unit-a")
 
     def test_validator_accepts_declared_auth_blocker(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

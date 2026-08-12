@@ -241,18 +241,22 @@ The current local build has 52 complete calibration packages and 24
 OmniObject3D request slots blocked on OpenXLab authentication. Tanks and Temples
 Meetingroom now includes the official individual scans/alignment, fixed-pose
 intrinsics calibration, undistorted 8+8 inputs, and an official-crop 1 cm laser
-reference; it is prepared but has no GenRecon prediction yet. Twenty-two
-existing G0 predictions have been recomputed under the same strict 2/5/10 cm,
-raw-global geometry schema. GT tiers and scene/instance tracks are never merged
-into one score. See `reports/GT_CALIBRATION_V1_REPORT_zh.md` for the source
-checksums, exact metrics, limitations, and reproduction commands.
+reference. The registry now contains 26 evaluated predictions: 22 legacy G0
+predictions plus four representative RGB-only runs for Meetingroom, 7-Scenes
+`chess`, Redwood `livingroom`, and DTU `scan24`. Those four runs use only the
+frozen eight conditioning RGB images and conditioning camera records; VGGT-1B
+pseudo geometry is aligned by a conditioning-camera-only Sim(3), with no
+heldout RGB/depth, reference geometry, or GT ICP. Protocol scope, GT tier,
+scene/instance unit type, and prediction-generation track are never merged into
+one score. See `reports/GT_CALIBRATION_V1_REPORT_zh.md` and
+`reports/GT_REPRESENTATIVE_GENRECON_V1_REPORT_zh.md` for source checksums,
+metrics, limitations, and reproduction commands.
 
 Representative same-camera review videos are available locally at
 `outputs/gt-calibration-v1/visualizations-v1/index.html`. Each prepared scene
 shows frozen reference RGB beside evaluation-only GT/reference geometry. The
-third panel contains a real GenRecon prediction only when the registry already
-has one; otherwise it is an explicit `missing-prediction` status card. Build
-and release-validate the review set with:
+third panel contains the registry-backed GenRecon prediction. Build and
+release-validate the review set with:
 
 ```sh
 EGL_PLATFORM=surfaceless .venv/bin/python \
@@ -260,9 +264,9 @@ EGL_PLATFORM=surfaceless .venv/bin/python \
 .venv/bin/python tools/validate_gt_calibration_videos.py
 ```
 
-The current review has six source/reference representatives, two actual
-GenRecon prediction renders, four explicit missing-prediction panels, and one
-OmniObject3D authentication blocker. See
+The current review has six source/reference representatives, six actual
+GenRecon prediction renders, no missing-prediction panel, and one OmniObject3D
+authentication blocker. See
 `reports/GT_CALIBRATION_VIDEO_VISUALIZATION_V1_REPORT_zh.md` for the per-dataset
 selection, provenance boundaries, hashes, and validation counts.
 

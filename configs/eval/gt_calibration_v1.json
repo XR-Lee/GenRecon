@@ -158,6 +158,28 @@
       ]
     }
   },
+  "prediction_overrides": {
+    "tanks-and-temples-meetingroom": {
+      "mesh": "outputs/gt-calibration-v1/representative-genrecon-v1/candidates/tanks-and-temples-meetingroom/prediction_official/mesh.ply",
+      "package_manifest": "outputs/gt-calibration-v1/representative-genrecon-v1/candidates/tanks-and-temples-meetingroom/prediction_official/manifest.json",
+      "track": "GT-pose-foundation-pseudo-geometry"
+    },
+    "seven-scenes-chess": {
+      "mesh": "outputs/gt-calibration-v1/representative-genrecon-v1/candidates/seven-scenes-chess/prediction_official/mesh.ply",
+      "package_manifest": "outputs/gt-calibration-v1/representative-genrecon-v1/candidates/seven-scenes-chess/prediction_official/manifest.json",
+      "track": "GT-pose-foundation-pseudo-geometry"
+    },
+    "redwood-livingroom": {
+      "mesh": "outputs/gt-calibration-v1/representative-genrecon-v1/candidates/redwood-livingroom/prediction_official/mesh.ply",
+      "package_manifest": "outputs/gt-calibration-v1/representative-genrecon-v1/candidates/redwood-livingroom/prediction_official/manifest.json",
+      "track": "GT-pose-foundation-pseudo-geometry"
+    },
+    "dtu-scan24": {
+      "mesh": "outputs/gt-calibration-v1/representative-genrecon-v1/candidates/dtu-scan24/prediction_official/mesh.ply",
+      "package_manifest": "outputs/gt-calibration-v1/representative-genrecon-v1/candidates/dtu-scan24/prediction_official/manifest.json",
+      "track": "GT-pose-foundation-pseudo-geometry"
+    }
+  },
   "evaluation_protocol": {
     "geometry_scope": "raw-global",
     "mesh_sampling": "triangle-area-weighted-uniform",

@@ -211,6 +211,13 @@ def _canonical_point_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def prediction_track_from_manifest(manifest: dict[str, Any]) -> str:
+    provenance = manifest.get("prediction_provenance")
+    if isinstance(provenance, dict) and isinstance(provenance.get("track"), str):
+        return provenance["track"]
+    return "prediction-provenance-not-recorded"
+
+
 def evaluate_unit(
     manifest_path: Path,
     predicted_mesh: Path,
@@ -305,6 +312,7 @@ def evaluate_unit(
             "physical_scene_group": manifest.get("physical_scene_group", manifest["unit_id"]),
             "dataset": manifest["dataset"],
             "track": manifest["track"],
+            "prediction_track": prediction_track_from_manifest(manifest),
             "gt_tier": manifest["gt_tier"],
         },
         "protocol": {
@@ -395,6 +403,82 @@ def _aggregate_group(
     }
 
 
+def _aggregate_by_label(
+    results: list[dict[str, Any]],
+    paths: dict[str, tuple[str, ...]],
+    key: str,
+    missing_label: str,
+) -> dict[str, Any]:
+    labels = sorted(
+        {result["unit"].get(key, missing_label) for result in results}
+    )
+    return {
+        label: _aggregate_group(
+            [
+                result
+                for result in results
+                if result["unit"].get(key, missing_label) == label
+            ],
+            paths,
+        )
+        for label in labels
+    }
+
+
+def _aggregate_by_tier_and_label(
+    results: list[dict[str, Any]],
+    paths: dict[str, tuple[str, ...]],
+    key: str,
+    missing_label: str,
+) -> dict[str, Any]:
+    tiers = sorted(
+        {result["unit"].get("gt_tier", "unknown-gt-tier") for result in results}
+    )
+    return {
+        tier: _aggregate_by_label(
+            [
+                result
+                for result in results
+                if result["unit"].get("gt_tier", "unknown-gt-tier") == tier
+            ],
+            paths,
+            key,
+            missing_label,
+        )
+        for tier in tiers
+    }
+
+
+def _summarize_homogeneous_results(
+    results: list[dict[str, Any]], protocol_signature: dict[str, Any] | None
+) -> dict[str, Any]:
+    paths = {
+        "chamfer_symmetric_mean_m": ("metrics", "chamfer_symmetric_mean_m"),
+        "fscore_at_0.05m": ("metrics", "threshold_scores", "0.050", "fscore_harmonic"),
+        "fscore_at_0.10m": ("metrics", "threshold_scores", "0.100", "fscore_harmonic"),
+        "normal_consistency": ("metrics", "normal_consistency", "symmetric_mean"),
+    }
+    return {
+        "result_count": len(results),
+        "protocol_signature": protocol_signature,
+        "tiers": _aggregate_by_label(
+            results, paths, "gt_tier", "unknown-gt-tier"
+        ),
+        "datasets": _aggregate_by_label(
+            results, paths, "dataset", "unknown-dataset"
+        ),
+        "tracks_by_tier": _aggregate_by_tier_and_label(
+            results, paths, "track", "unknown-unit-track"
+        ),
+        "prediction_tracks_by_tier": _aggregate_by_tier_and_label(
+            results,
+            paths,
+            "prediction_track",
+            "prediction-provenance-not-recorded",
+        ),
+    }
+
+
 def summarize_results(results: list[dict[str, Any]]) -> dict[str, Any]:
     protocol_fields = (
         "samples_per_prediction",
@@ -404,47 +488,40 @@ def summarize_results(results: list[dict[str, Any]]) -> dict[str, Any]:
         "normalized_thresholds",
         "scope",
     )
-    protocol_signatures = {
-        json.dumps(
-            {key: result["protocol"].get(key) for key in protocol_fields},
-            sort_keys=True,
-        )
-        for result in results
-        if "protocol" in result
-    }
-    if protocol_signatures and (
-        len(protocol_signatures) != 1
-        or any("protocol" not in result for result in results)
-    ):
+    signatures: dict[str, tuple[dict[str, Any], list[dict[str, Any]]]] = {}
+    missing_protocol = []
+    for result in results:
+        if "protocol" not in result:
+            missing_protocol.append(result)
+            continue
+        signature = {key: result["protocol"].get(key) for key in protocol_fields}
+        serialized = json.dumps(signature, sort_keys=True)
+        signatures.setdefault(serialized, (signature, []))[1].append(result)
+
+    if missing_protocol and signatures:
         raise GroundTruthSuiteError(
-            "Cannot aggregate results with mixed or missing evaluation protocols"
+            "Cannot aggregate results with mixed present and missing evaluation protocols"
         )
-    paths = {
-        "chamfer_symmetric_mean_m": ("metrics", "chamfer_symmetric_mean_m"),
-        "fscore_at_0.05m": ("metrics", "threshold_scores", "0.050", "fscore_harmonic"),
-        "fscore_at_0.10m": ("metrics", "threshold_scores", "0.100", "fscore_harmonic"),
-        "normal_consistency": ("metrics", "normal_consistency", "symmetric_mean"),
-    }
-    groupings = {
-        "tiers": "gt_tier",
-        "datasets": "dataset",
-        "tracks": "track",
-    }
-    summary: dict[str, Any] = {"result_count": len(results)}
-    for output_key, unit_key in groupings.items():
-        grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        for result in results:
-            grouped[result["unit"][unit_key]].append(result)
-        summary[output_key] = {
-            label: _aggregate_group(items, paths)
-            for label, items in sorted(grouped.items())
-        }
+    if not signatures:
+        return _summarize_homogeneous_results(results, None)
+    if len(signatures) == 1:
+        signature, grouped_results = next(iter(signatures.values()))
+        return _summarize_homogeneous_results(grouped_results, signature)
+
+    protocol_groups = []
+    for serialized in sorted(signatures):
+        signature, grouped_results = signatures[serialized]
+        group = _summarize_homogeneous_results(grouped_results, signature)
+        group["unit_ids"] = sorted(
+            result["unit"].get("unit_id", "") for result in grouped_results
+        )
+        protocol_groups.append(group)
     return {
         "result_count": len(results),
-        "protocol_signature": (
-            json.loads(next(iter(protocol_signatures))) if protocol_signatures else None
-        ),
-        **{key: value for key, value in summary.items() if key != "result_count"},
+        "protocol_signature": None,
+        "protocol_group_count": len(protocol_groups),
+        "aggregate_policy": "no-cross-protocol-aggregation",
+        "protocol_groups": protocol_groups,
     }
 
 
@@ -505,6 +582,43 @@ def evaluate_registry(
     return index
 
 
+def validate_result_registry_membership(
+    results: list[dict[str, Any]], registry_path: Path
+) -> dict[str, Any]:
+    registry_path = registry_path.resolve()
+    registry = load_json(registry_path)
+    if registry.get("schema") != REGISTRY_SCHEMA:
+        raise GroundTruthSuiteError(f"Unexpected registry schema in {registry_path}")
+    by_id = {unit["unit_id"]: unit for unit in registry.get("units", [])}
+    result_ids = {result["unit"]["unit_id"] for result in results}
+    unexpected = sorted(result_ids - set(by_id))
+    if unexpected:
+        raise GroundTruthSuiteError(
+            f"Evaluation results are absent from the registry: {unexpected}"
+        )
+    for result in results:
+        unit_id = result["unit"]["unit_id"]
+        row = by_id[unit_id]
+        prediction_value = row.get("prediction_mesh")
+        if row.get("status") != "prepared" or not prediction_value:
+            raise GroundTruthSuiteError(
+                f"Evaluation result is stale because registry prediction is unavailable for {unit_id}"
+            )
+        registered_manifest = resolve_path(row["manifest"], registry_path.parent)
+        registered_prediction = resolve_path(prediction_value, registry_path.parent)
+        result_manifest = Path(result["inputs"]["manifest"]).resolve()
+        result_prediction = Path(result["inputs"]["predicted_mesh"]).resolve()
+        if registered_manifest != result_manifest:
+            raise GroundTruthSuiteError(
+                f"Evaluation manifest differs from registry for {unit_id}"
+            )
+        if registered_prediction != result_prediction:
+            raise GroundTruthSuiteError(
+                f"Evaluation prediction differs from registry for {unit_id}"
+            )
+    return registry
+
+
 def summarize_output(output_root: Path) -> dict[str, Any]:
     output_root = output_root.resolve()
     previous = load_json(output_root / "index.json")
@@ -525,10 +639,24 @@ def summarize_output(output_root: Path) -> dict[str, Any]:
             "track": manifest["track"],
             "gt_tier": manifest["gt_tier"],
         }
-        if current_unit != result["unit"]:
+        stored_unit = {key: result["unit"].get(key) for key in current_unit}
+        if current_unit != stored_unit:
             raise GroundTruthSuiteError(
                 f"Unit metadata changed since evaluation for {result['unit']['unit_id']}"
             )
+        current_prediction_track = prediction_track_from_manifest(manifest)
+        stored_prediction_track = result["unit"].get("prediction_track")
+        if stored_prediction_track is None:
+            if current_prediction_track != "prediction-provenance-not-recorded":
+                raise GroundTruthSuiteError(
+                    f"Prediction track is missing from a non-legacy evaluation for "
+                    f"{result['unit']['unit_id']}"
+                )
+        elif stored_prediction_track != current_prediction_track:
+            raise GroundTruthSuiteError(
+                f"Prediction track changed since evaluation for {result['unit']['unit_id']}"
+            )
+        result["unit"]["prediction_track"] = current_prediction_track
         if manifest["reference"]["kind"] != result["inputs"]["reference_kind"]:
             raise GroundTruthSuiteError(
                 f"Reference kind changed since evaluation for {result['unit']['unit_id']}"
@@ -562,8 +690,14 @@ def summarize_output(output_root: Path) -> dict[str, Any]:
             raise GroundTruthSuiteError(
                 f"Prediction hash changed since evaluation for {result['unit']['unit_id']}"
             )
+        current_scope = manifest["reference"].get("scope", "raw-global")
+        stored_scope = result["protocol"].get("scope")
+        if stored_scope is not None and stored_scope != current_scope:
+            raise GroundTruthSuiteError(
+                f"Reference scope changed since evaluation for {result['unit']['unit_id']}"
+            )
         result["inputs"]["manifest_sha256"] = sha256_file(manifest_path)
-        result["protocol"]["scope"] = manifest["reference"].get("scope", "raw-global")
+        result["protocol"]["scope"] = current_scope
         write_json(path, result)
         results.append(result)
     if not results:
@@ -575,15 +709,7 @@ def summarize_output(output_root: Path) -> dict[str, Any]:
     registry_value = previous.get("registry")
     if registry_value:
         registry_path = Path(registry_value)
-        registry = load_json(registry_path)
-        if registry.get("schema") != REGISTRY_SCHEMA:
-            raise GroundTruthSuiteError(f"Unexpected registry schema in {registry_path}")
-        registry_ids = {unit["unit_id"] for unit in registry.get("units", [])}
-        unexpected = sorted(result_ids - registry_ids)
-        if unexpected:
-            raise GroundTruthSuiteError(
-                f"Evaluation results are absent from the registry: {unexpected}"
-            )
+        registry = validate_result_registry_membership(results, registry_path)
         for unit in registry.get("units", []):
             if unit["unit_id"] in result_ids:
                 continue

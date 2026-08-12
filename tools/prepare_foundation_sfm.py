@@ -534,6 +534,7 @@ def cross_view_sparse_points(
     points = world_points[source, y_model, x_model].astype(np.float64, copy=False)
     confidence_selected = confidence.ravel()[flat_indices].astype(np.float32, copy=False)
     support = np.zeros(len(points), dtype=np.int16)
+    overlap_opportunity = np.zeros(len(points), dtype=np.int16)
     best_relative_residual = np.full(len(points), np.inf, dtype=np.float32)
     target_confidence_threshold = float(np.percentile(confidence_values, 50))
 
@@ -574,6 +575,7 @@ def cross_view_sparse_points(
         if indices.size == 0:
             continue
         target_depth = depth[target, y_nearest[indices], x_nearest[indices]]
+        overlap_opportunity[indices] += 1
         relative = np.abs(z_camera[indices] - target_depth) / np.maximum(
             np.maximum(z_camera[indices], target_depth), 1e-6
         )
@@ -584,6 +586,8 @@ def cross_view_sparse_points(
         )
 
     verified = support >= minimum_support
+    overlap_available = overlap_opportunity > 0
+    overlap_opportunity_count = int(np.count_nonzero(overlap_available))
     verified_count = int(np.count_nonzero(verified))
     fallback_to_unverified = verified_count < min(5_000, maximum_points)
     eligible = verified if not fallback_to_unverified else np.ones(len(points), dtype=bool)
@@ -668,6 +672,11 @@ def cross_view_sparse_points(
         "prefiltered_points": int(len(points)),
         "cross_view_verified_points": verified_count,
         "cross_view_verified_fraction": verified_count / max(len(points), 1),
+        "cross_view_overlap_opportunity_points": overlap_opportunity_count,
+        "cross_view_overlap_opportunity_fraction": overlap_opportunity_count
+        / max(len(points), 1),
+        "cross_view_verified_fraction_given_overlap": verified_count
+        / max(overlap_opportunity_count, 1),
         "relative_depth_tolerance": relative_depth_tolerance,
         "minimum_other_view_support": minimum_support,
         "fallback_includes_unverified_points": fallback_to_unverified,
