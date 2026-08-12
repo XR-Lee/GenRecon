@@ -7,13 +7,18 @@ from pathlib import Path
 from zipfile import ZipFile
 
 import numpy as np
+import trimesh
 
 from tools.prepare_gt_calibration_datasets import (
     CalibrationBuildError,
     _backproject_depth,
+    _build_tnt_reference,
     _parse_dtu_camera,
     _parse_pose,
+    _parse_tnt_alignment,
     _read_redwood_poses,
+    _transform_tnt_camera_pose,
+    _validate_existing_frozen_hashes,
     safe_zip_names,
     sha256_file,
     uniform_indices,
@@ -80,6 +85,98 @@ intrinsic
             poses = _read_redwood_poses(path)
         self.assertEqual(len(poses), 1)
         np.testing.assert_array_equal(poses[0][:3, 3], [1, 2, 3])
+
+    def test_tnt_alignment_is_parsed_and_applied_to_camera_pose(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "alignment.txt"
+            matrix = np.eye(4)
+            matrix[:3, :3] *= 2.0
+            matrix[:3, 3] = [1.0, 2.0, 3.0]
+            np.savetxt(path, matrix)
+            alignment = _parse_tnt_alignment(path)
+        pose = np.eye(4)
+        pose[:3, 3] = [4.0, 5.0, 6.0]
+        transformed = _transform_tnt_camera_pose(pose, alignment)
+        self.assertAlmostEqual(alignment["scale"], 2.0)
+        np.testing.assert_allclose(transformed[:3, :3], np.eye(3))
+        np.testing.assert_allclose(transformed[:3, 3], [9.0, 12.0, 15.0])
+
+    def test_tnt_frozen_hash_rejects_existing_modified_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp)
+            artifact = source / "artifact.bin"
+            artifact.write_bytes(b"modified")
+            with self.assertRaisesRegex(CalibrationBuildError, "frozen SHA256 mismatch"):
+                _validate_existing_frozen_hashes(
+                    source,
+                    [{"artifact.bin": "0" * 64}, {"missing.bin": "1" * 64}],
+                )
+
+    def test_tnt_reference_applies_polygon_crop_and_global_voxel_dedup(self) -> None:
+        dtype = np.dtype(
+            [
+                ("x", "<f8"),
+                ("y", "<f8"),
+                ("z", "<f8"),
+                ("red", "u1"),
+                ("green", "u1"),
+                ("blue", "u1"),
+            ]
+        )
+
+        def payload(points: list[tuple[float, float, float]]) -> bytes:
+            values = np.zeros(len(points), dtype=dtype)
+            values["x"], values["y"], values["z"] = np.asarray(points).T
+            values["red"] = 10
+            values["green"] = 20
+            values["blue"] = 30
+            header = (
+                "ply\nformat binary_little_endian 1.0\n"
+                f"element vertex {len(points)}\n"
+                "property double x\nproperty double y\nproperty double z\n"
+                "property uchar red\nproperty uchar green\nproperty uchar blue\n"
+                "end_header\n"
+            ).encode("ascii")
+            return header + values.tobytes()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            archive_path = root / "scans.zip"
+            with ZipFile(archive_path, "w") as archive:
+                archive.writestr(
+                    "Meetingroom/scan1.ply",
+                    payload([(0.0, 0.0, 0.0), (0.001, 0.0, 0.0), (0.02, 0.0, 0.0), (2.0, 2.0, 0.0)]),
+                )
+                archive.writestr(
+                    "Meetingroom/scan2.ply",
+                    payload([(0.002, 0.0, 0.0), (0.03, 0.0, 0.0)]),
+                )
+            crop_path = root / "crop.json"
+            write_json(
+                crop_path,
+                {
+                    "axis_min": -1.0,
+                    "axis_max": 1.0,
+                    "bounding_polygon": [[-1.0, -1.0, 0.0], [1.0, -1.0, 0.0], [1.0, 1.0, 0.0], [-1.0, 1.0, 0.0]],
+                    "orthogonal_axis": "Z",
+                },
+            )
+            output = root / "reference.ply"
+            metadata = root / "build.json"
+            first = _build_tnt_reference(
+                archive_path, crop_path, output, metadata, force=True, max_points=None
+            )
+            first_hash = sha256_file(output)
+            second = _build_tnt_reference(
+                archive_path, crop_path, output, metadata, force=True, max_points=None
+            )
+            loaded = trimesh.load(output, process=False)
+        self.assertEqual(first["stats"]["source_points"], 6)
+        self.assertEqual(first["stats"]["points_after_official_crop_before_deduplication"], 5)
+        self.assertEqual(first["stats"]["global_voxel_points"], 3)
+        self.assertEqual(first["stats"]["exported_points"], 3)
+        self.assertEqual(first_hash, second["output"]["sha256"])
+        self.assertEqual(len(loaded.vertices), 3)
 
     def test_validator_accepts_declared_auth_blocker(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

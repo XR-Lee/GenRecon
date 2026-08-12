@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Iterable
 from zipfile import ZipFile
 
+import cv2
 import numpy as np
 import py7zr
 import trimesh
@@ -793,7 +794,403 @@ def prepare_dtu(plan: dict[str, Any], output: Path, source_root: Path, *, force:
     return rows
 
 
-def prepare_tanks_and_temples(plan: dict[str, Any], output: Path, source_root: Path) -> list[dict[str, Any]]:
+_PLY_SCALAR_TYPES = {
+    "char": "i1",
+    "uchar": "u1",
+    "int8": "i1",
+    "uint8": "u1",
+    "short": "<i2",
+    "ushort": "<u2",
+    "int16": "<i2",
+    "uint16": "<u2",
+    "int": "<i4",
+    "uint": "<u4",
+    "int32": "<i4",
+    "uint32": "<u4",
+    "float": "<f4",
+    "float32": "<f4",
+    "double": "<f8",
+    "float64": "<f8",
+}
+
+
+def _parse_tnt_alignment(path: Path) -> dict[str, Any]:
+    matrix = np.loadtxt(path, dtype=np.float64)
+    if matrix.shape != (4, 4) or not np.isfinite(matrix).all():
+        raise CalibrationBuildError(f"Invalid T&T alignment matrix: {path}")
+    if not np.allclose(matrix[3], [0.0, 0.0, 0.0, 1.0], atol=1e-10):
+        raise CalibrationBuildError(f"Invalid T&T homogeneous alignment row: {path}")
+    linear = matrix[:3, :3]
+    determinant = float(np.linalg.det(linear))
+    if determinant <= 0.0:
+        raise CalibrationBuildError(f"T&T alignment must be an orientation-preserving Sim(3): {path}")
+    scale = float(np.cbrt(determinant))
+    rotation = linear / scale
+    orthogonality_error = float(np.linalg.norm(rotation.T @ rotation - np.eye(3)))
+    if abs(float(np.linalg.det(rotation)) - 1.0) > 1e-8 or orthogonality_error > 1e-8:
+        raise CalibrationBuildError(f"T&T alignment is not a valid Sim(3): {path}")
+    return {
+        "matrix": matrix,
+        "scale": scale,
+        "rotation": rotation,
+        "translation": matrix[:3, 3].copy(),
+        "rotation_orthogonality_error": orthogonality_error,
+    }
+
+
+def _transform_tnt_camera_pose(
+    camera_to_colmap_world: np.ndarray, alignment: dict[str, Any]
+) -> np.ndarray:
+    pose = np.asarray(camera_to_colmap_world, dtype=np.float64)
+    if pose.shape != (4, 4) or not np.isfinite(pose).all():
+        raise CalibrationBuildError("Invalid T&T camera-to-world pose")
+    output = np.eye(4, dtype=np.float64)
+    output[:3, :3] = alignment["rotation"] @ pose[:3, :3]
+    output[:3, 3] = (
+        alignment["matrix"][:3, :3] @ pose[:3, 3] + alignment["translation"]
+    )
+    if not np.allclose(output[:3, :3].T @ output[:3, :3], np.eye(3), atol=1e-8):
+        raise CalibrationBuildError("T&T aligned camera rotation is not orthonormal")
+    return output
+
+
+def _load_tnt_intrinsics(
+    path: Path, image_archive: Path, camera_log: Path
+) -> dict[str, Any]:
+    document = load_json(path)
+    if document.get("schema") != "genrecon.tnt-fixed-pose-intrinsics":
+        raise CalibrationBuildError(f"Unexpected T&T calibration schema: {path}")
+    if document.get("schema_version") != 2:
+        raise CalibrationBuildError(f"Unsupported T&T calibration version: {path}")
+    if document.get("protocol", {}).get("revision") != "v2-single-thread-geometry":
+        raise CalibrationBuildError(f"Unsupported T&T calibration protocol: {path}")
+    gates = document.get("quality_gates")
+    if (
+        document.get("result") != "pass"
+        or not isinstance(gates, dict)
+        or not gates
+        or not all(gates.values())
+    ):
+        raise CalibrationBuildError(f"T&T calibration quality gates did not pass: {path}")
+    expected = {
+        "image_archive_sha256": sha256_file(image_archive),
+        "camera_log_sha256": sha256_file(camera_log),
+    }
+    for key, value in expected.items():
+        if document.get("source", {}).get(key) != value:
+            raise CalibrationBuildError(f"T&T calibration source hash mismatch for {key}")
+    calibration = document.get("calibration", {})
+    params = np.asarray(calibration.get("params", []), dtype=np.float64)
+    if (
+        calibration.get("model") != "SIMPLE_RADIAL"
+        or params.shape != (4,)
+        or not np.isfinite(params).all()
+        or calibration.get("width", 0) <= 0
+        or calibration.get("height", 0) <= 0
+    ):
+        raise CalibrationBuildError(f"Invalid T&T recovered intrinsics: {path}")
+    return document
+
+
+def _tnt_undistortion(calibration: dict[str, Any]) -> dict[str, Any]:
+    camera = calibration["calibration"]
+    width, height = int(camera["width"]), int(camera["height"])
+    focal, cx, cy, radial = (float(value) for value in camera["params"])
+    source_intrinsic = np.asarray(
+        [[focal, 0.0, cx], [0.0, focal, cy], [0.0, 0.0, 1.0]], dtype=np.float64
+    )
+    distortion = np.asarray([radial, 0.0, 0.0, 0.0, 0.0], dtype=np.float64)
+    new_intrinsic, roi = cv2.getOptimalNewCameraMatrix(
+        source_intrinsic,
+        distortion,
+        (width, height),
+        alpha=0,
+        newImgSize=(width, height),
+    )
+    x, y, output_width, output_height = (int(value) for value in roi)
+    if output_width <= 0 or output_height <= 0:
+        raise CalibrationBuildError("T&T undistortion produced an empty ROI")
+    map_x, map_y = cv2.initUndistortRectifyMap(
+        source_intrinsic,
+        distortion,
+        None,
+        new_intrinsic,
+        (width, height),
+        cv2.CV_32FC1,
+    )
+    output_intrinsic = new_intrinsic.copy()
+    output_intrinsic[0, 2] -= x
+    output_intrinsic[1, 2] -= y
+    return {
+        "source_intrinsic": source_intrinsic,
+        "distortion": distortion,
+        "map_x": map_x,
+        "map_y": map_y,
+        "roi": [x, y, output_width, output_height],
+        "intrinsic": output_intrinsic,
+        "width": output_width,
+        "height": output_height,
+    }
+
+
+def _point_in_polygon_xy(points: np.ndarray, polygon: np.ndarray) -> np.ndarray:
+    x = points[:, 0]
+    y = points[:, 1]
+    inside = np.zeros(len(points), dtype=bool)
+    previous = polygon[-1]
+    for current in polygon:
+        x0, y0 = previous
+        x1, y1 = current
+        crossing = (y0 > y) != (y1 > y)
+        denominator = y1 - y0
+        x_intersection = (x1 - x0) * (y - y0) / (
+            denominator if abs(denominator) > 1e-15 else 1e-15
+        ) + x0
+        inside ^= crossing & (x < x_intersection)
+        previous = current
+    return inside
+
+
+def _read_exact(handle: Any, size: int) -> bytes:
+    chunks = []
+    remaining = size
+    while remaining:
+        block = handle.read(remaining)
+        if not block:
+            raise CalibrationBuildError(f"Unexpected end of binary PLY ({remaining} bytes missing)")
+        chunks.append(block)
+        remaining -= len(block)
+    return b"".join(chunks)
+
+
+def _read_binary_ply_header(handle: Any) -> tuple[int, np.dtype[Any]]:
+    first = handle.readline()
+    if first.strip() != b"ply":
+        raise CalibrationBuildError("Invalid PLY signature in T&T scans archive")
+    vertex_count = None
+    current_element = None
+    properties: list[tuple[str, str]] = []
+    while True:
+        raw = handle.readline()
+        if not raw:
+            raise CalibrationBuildError("Truncated PLY header in T&T scans archive")
+        line = raw.decode("ascii").strip()
+        if line == "end_header":
+            break
+        values = line.split()
+        if values[:2] == ["format", "binary_little_endian"]:
+            continue
+        if values and values[0] == "format":
+            raise CalibrationBuildError(f"Unsupported T&T PLY format: {line}")
+        if len(values) == 3 and values[0] == "element":
+            current_element = values[1]
+            if current_element == "vertex":
+                vertex_count = int(values[2])
+            continue
+        if values and values[0] == "property" and current_element == "vertex":
+            if len(values) != 3 or values[1] == "list":
+                raise CalibrationBuildError(f"Unsupported T&T vertex property: {line}")
+            if values[1] not in _PLY_SCALAR_TYPES:
+                raise CalibrationBuildError(f"Unsupported T&T PLY scalar type: {values[1]}")
+            properties.append((values[2], _PLY_SCALAR_TYPES[values[1]]))
+    if vertex_count is None or vertex_count <= 0:
+        raise CalibrationBuildError("T&T PLY has no vertices")
+    required = {"x", "y", "z", "red", "green", "blue"}
+    if not required.issubset(name for name, _ in properties):
+        raise CalibrationBuildError("T&T PLY is missing XYZ or RGB vertex properties")
+    return vertex_count, np.dtype(properties, align=False)
+
+
+def _write_binary_pointcloud(path: Path, points: np.ndarray, colors: np.ndarray) -> None:
+    if points.shape != (len(colors), 3) or colors.shape[1:] != (3,):
+        raise CalibrationBuildError("Point/color shape mismatch while writing T&T reference")
+    payload = np.empty(
+        len(points),
+        dtype=np.dtype(
+            [
+                ("x", "<f4"),
+                ("y", "<f4"),
+                ("z", "<f4"),
+                ("red", "u1"),
+                ("green", "u1"),
+                ("blue", "u1"),
+            ],
+            align=False,
+        ),
+    )
+    payload["x"], payload["y"], payload["z"] = points.T.astype(np.float32)
+    payload["red"], payload["green"], payload["blue"] = colors.T.astype(np.uint8)
+    header = (
+        "ply\n"
+        "format binary_little_endian 1.0\n"
+        "comment GenRecon T&T official-scan 1cm voxel reference\n"
+        f"element vertex {len(points)}\n"
+        "property float x\nproperty float y\nproperty float z\n"
+        "property uchar red\nproperty uchar green\nproperty uchar blue\n"
+        "end_header\n"
+    ).encode("ascii")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("wb") as handle:
+        handle.write(header)
+        handle.write(payload.tobytes())
+
+
+def _build_tnt_reference(
+    scans_archive: Path,
+    crop_json: Path,
+    output_path: Path,
+    metadata_path: Path,
+    *,
+    force: bool,
+    voxel_m: float = 0.01,
+    max_points: int | None = None,
+) -> dict[str, Any]:
+    source_hashes = {
+        "scans_archive_sha256": sha256_file(scans_archive),
+        "crop_json_sha256": sha256_file(crop_json),
+    }
+    if output_path.is_file() and metadata_path.is_file() and not force:
+        metadata = load_json(metadata_path)
+        if (
+            metadata.get("source") == source_hashes
+            and metadata.get("protocol", {}).get("voxel_m") == voxel_m
+            and metadata.get("protocol", {}).get("max_points") == max_points
+            and metadata.get("output", {}).get("sha256") == sha256_file(output_path)
+        ):
+            return metadata
+
+    crop = load_json(crop_json)
+    if crop.get("orthogonal_axis") != "Z":
+        raise CalibrationBuildError("T&T adapter currently requires a Z-axis crop volume")
+    polygon = np.asarray(crop.get("bounding_polygon", []), dtype=np.float64)[:, :2]
+    z_min, z_max = float(crop["axis_min"]), float(crop["axis_max"])
+    if polygon.ndim != 2 or polygon.shape[0] < 3 or polygon.shape[1] != 2:
+        raise CalibrationBuildError("Invalid T&T crop polygon")
+    bounds_min = np.asarray([*polygon.min(axis=0), z_min], dtype=np.float64)
+    bounds_max = np.asarray([*polygon.max(axis=0), z_max], dtype=np.float64)
+    voxel_min = np.floor(bounds_min / voxel_m).astype(np.int64) - 1
+    voxel_max = np.floor(bounds_max / voxel_m).astype(np.int64) + 1
+    dimensions = voxel_max - voxel_min + 1
+    if int(np.prod(dimensions.astype(object))) >= np.iinfo(np.int64).max:
+        raise CalibrationBuildError("T&T voxel key range exceeds int64")
+
+    all_keys: list[np.ndarray] = []
+    all_points: list[np.ndarray] = []
+    all_colors: list[np.ndarray] = []
+    source_points = 0
+    cropped_points = 0
+    scan_names = []
+    with ZipFile(scans_archive) as archive:
+        names = safe_zip_names(archive)
+        scan_names = sorted(
+            name for name in names if Path(name).suffix.lower() == ".ply"
+        )
+        if not scan_names:
+            raise CalibrationBuildError(f"No PLY scans in {scans_archive}")
+        for name in scan_names:
+            with archive.open(name) as handle:
+                vertex_count, dtype = _read_binary_ply_header(handle)
+                source_points += vertex_count
+                remaining = vertex_count
+                while remaining:
+                    count = min(remaining, 500_000)
+                    vertices = np.frombuffer(
+                        _read_exact(handle, count * dtype.itemsize), dtype=dtype
+                    )
+                    points = np.column_stack(
+                        (vertices["x"], vertices["y"], vertices["z"])
+                    ).astype(np.float64)
+                    colors = np.column_stack(
+                        (vertices["red"], vertices["green"], vertices["blue"])
+                    ).astype(np.uint8)
+                    finite = np.isfinite(points).all(axis=1)
+                    in_z = (points[:, 2] >= z_min) & (points[:, 2] <= z_max)
+                    mask = finite & in_z & _point_in_polygon_xy(points, polygon)
+                    points = points[mask]
+                    colors = colors[mask]
+                    cropped_points += len(points)
+                    if len(points):
+                        indices = np.floor(points / voxel_m).astype(np.int64) - voxel_min
+                        keys = (
+                            (indices[:, 0] * dimensions[1] + indices[:, 1])
+                            * dimensions[2]
+                            + indices[:, 2]
+                        )
+                        _, unique_indices = np.unique(keys, return_index=True)
+                        unique_indices.sort()
+                        all_keys.append(keys[unique_indices])
+                        all_points.append(points[unique_indices].astype(np.float32))
+                        all_colors.append(colors[unique_indices])
+                    remaining -= count
+
+    keys = np.concatenate(all_keys)
+    points = np.concatenate(all_points)
+    colors = np.concatenate(all_colors)
+    _, unique_indices = np.unique(keys, return_index=True)
+    unique_indices.sort()
+    points = points[unique_indices]
+    colors = colors[unique_indices]
+    full_voxel_bounds = np.stack((points.min(axis=0), points.max(axis=0)))
+    voxel_points = len(points)
+    if max_points is not None and len(points) > max_points:
+        rng = np.random.default_rng(42)
+        selected = np.sort(rng.choice(len(points), max_points, replace=False))
+        points = points[selected]
+        colors = colors[selected]
+    _write_binary_pointcloud(output_path, points, colors)
+    metadata = {
+        "schema": "genrecon.tnt-reference-build",
+        "schema_version": 1,
+        "source": source_hashes,
+        "protocol": {
+            "crop": "official SelectionPolygonVolume",
+            "voxel_m": voxel_m,
+            "max_points": max_points,
+            "seed": 42,
+            "overlap_policy": "one deterministic representative per global voxel",
+        },
+        "stats": {
+            "scan_count": len(scan_names),
+            "scan_names": scan_names,
+            "source_points": source_points,
+            "points_after_official_crop_before_deduplication": cropped_points,
+            "global_voxel_points": voxel_points,
+            "exported_points": len(points),
+            "bounds_m": full_voxel_bounds.tolist(),
+        },
+        "output": {
+            "path": str(output_path.resolve()),
+            "size_bytes": output_path.stat().st_size,
+            "sha256": sha256_file(output_path),
+        },
+    }
+    write_json(metadata_path, metadata)
+    return metadata
+
+
+def _validate_existing_frozen_hashes(
+    source: Path, hash_groups: list[dict[str, str]]
+) -> None:
+    for hashes in hash_groups:
+        for filename, expected_sha256 in hashes.items():
+            path = source / filename
+            if not path.is_file():
+                continue
+            actual_sha256 = sha256_file(path)
+            if actual_sha256 != expected_sha256:
+                raise CalibrationBuildError(
+                    f"T&T frozen SHA256 mismatch for {path}: "
+                    f"{actual_sha256} != {expected_sha256}"
+                )
+
+
+def prepare_tanks_and_temples(
+    plan: dict[str, Any],
+    output: Path,
+    source_root: Path,
+    *,
+    force: bool,
+) -> list[dict[str, Any]]:
     dataset = plan["datasets"]["tanks-and-temples-training"]
     unit_id = "tanks-and-temples-meetingroom"
     source = source_root / "tanks-and-temples"
@@ -804,6 +1201,14 @@ def prepare_tanks_and_temples(plan: dict[str, Any], output: Path, source_root: P
     crop_json = source / "Meetingroom_crop.json"
     scans_archive = source / "Meetingroom_individual_scans.zip"
     alignment = source / "Meetingroom_alignment.txt"
+    intrinsics_artifact = source / "Meetingroom_intrinsics.json"
+    _validate_existing_frozen_hashes(
+        source,
+        [
+            dataset.get("frozen_import_sha256", {}),
+            dataset.get("frozen_derived_sha256", {}),
+        ],
+    )
     input_required = [video, images, camera_log, crop_json]
     input_valid = (
         all(path.is_file() for path in input_required)
@@ -812,13 +1217,36 @@ def prepare_tanks_and_temples(plan: dict[str, Any], output: Path, source_root: P
     )
     scans_valid = scans_archive.is_file() and file_prefix(scans_archive, 4) == b"PK\x03\x04"
     alignment_valid = alignment.is_file() and alignment.stat().st_size > 0
+    calibration_valid = False
+    calibration: dict[str, Any] | None = None
+    calibration_error: str | None = None
+    if input_valid and intrinsics_artifact.is_file():
+        try:
+            calibration = _load_tnt_intrinsics(intrinsics_artifact, images, camera_log)
+            calibration_valid = True
+        except Exception as exc:
+            calibration_error = f"{type(exc).__name__}: {exc}"
+    source_complete = input_valid and scans_valid and alignment_valid and calibration_valid
+    if force and unit_dir.exists():
+        shutil.rmtree(unit_dir)
     camera_records: list[dict[str, Any]] = []
-    reference_paths: list[Path] = []
-    if input_valid:
+    reference_path = unit_dir / "reference" / "Meetingroom_1cm_crop.ply"
+    reference_build_path = unit_dir / "reference" / "build.json"
+    reference_build: dict[str, Any] | None = None
+    alignment_info: dict[str, Any] | None = None
+    if input_valid and alignment_valid:
+        alignment_info = _parse_tnt_alignment(alignment)
+    if source_complete:
+        assert calibration is not None and alignment_info is not None
+        undistortion = _tnt_undistortion(calibration)
         poses = _read_redwood_poses(camera_log)
         with ZipFile(images) as archive:
             names = safe_zip_names(archive)
-            image_names = sorted(name for name in names if Path(name).suffix.lower() in {".jpg", ".jpeg", ".png"})
+            image_names = sorted(
+                name
+                for name in names
+                if Path(name).suffix.lower() in {".jpg", ".jpeg", ".png"}
+            )
             if len(image_names) != len(poses):
                 raise CalibrationBuildError(
                     f"T&T image/pose count mismatch: {len(image_names)} != {len(poses)}"
@@ -826,23 +1254,36 @@ def prepare_tanks_and_temples(plan: dict[str, Any], output: Path, source_root: P
             selected = uniform_indices(len(image_names), 16)
             input_indices = selected[::2][:8]
             heldout_indices = [index for index in selected if index not in input_indices][:8]
+            x, y, width, height = undistortion["roi"]
             for role, indices in (("conditioning", input_indices), ("heldout", heldout_indices)):
                 for order, index in enumerate(indices):
-                    path = unit_dir / "rgb" / role / f"{order:03d}.jpg"
+                    path = unit_dir / "rgb" / role / f"{order:03d}.png"
                     path.parent.mkdir(parents=True, exist_ok=True)
-                    payload = archive.read(image_names[index])
-                    path.write_bytes(payload)
-                    with Image.open(io.BytesIO(payload)) as image:
-                        width, height = image.size
+                    with Image.open(io.BytesIO(archive.read(image_names[index]))) as opened:
+                        rgb = np.asarray(opened.convert("RGB"))
+                    undistorted = cv2.remap(
+                        rgb,
+                        undistortion["map_x"],
+                        undistortion["map_y"],
+                        interpolation=cv2.INTER_LINEAR,
+                        borderMode=cv2.BORDER_CONSTANT,
+                    )[y : y + height, x : x + width]
+                    if undistorted.shape[:2] != (height, width):
+                        raise CalibrationBuildError("Unexpected T&T undistorted image shape")
+                    Image.fromarray(undistorted).save(path, compress_level=6)
+                    camera_to_gt = _transform_tnt_camera_pose(poses[index], alignment_info)
                     camera_records.append(
                         {
                             "role": role,
                             "order": order,
+                            "source_index": index,
                             "source_image": image_names[index],
                             "rgb": relpath(path, unit_dir),
-                            "camera_to_world": poses[index].tolist(),
+                            "camera_to_world": camera_to_gt.tolist(),
+                            "camera_to_colmap_world": poses[index].tolist(),
                             "image_size": [width, height],
-                            "intrinsics": None,
+                            "intrinsics": undistortion["intrinsic"].tolist(),
+                            "source_camera_model": calibration["calibration"],
                         }
                     )
         write_json(
@@ -851,60 +1292,103 @@ def prepare_tanks_and_temples(plan: dict[str, Any], output: Path, source_root: P
                 "schema": "genrecon.gt-camera-split",
                 "schema_version": 1,
                 "pose_convention": "camera-to-world",
-                "intrinsics_status": "not-published-in-log-requires-colmap-recovery",
+                "world_frame": "official laser GT frame",
+                "intrinsics_status": "recovered-with-all-official-poses-fixed",
+                "intrinsics_artifact": relpath(intrinsics_artifact, unit_dir),
+                "source_to_gt_sim3": {
+                    "matrix": alignment_info["matrix"].tolist(),
+                    "scale": alignment_info["scale"],
+                    "rotation_orthogonality_error": alignment_info[
+                        "rotation_orthogonality_error"
+                    ],
+                },
+                "undistortion": {
+                    "source_model": "SIMPLE_RADIAL",
+                    "source_params": calibration["calibration"]["params"],
+                    "roi": undistortion["roi"],
+                    "output_model": "PINHOLE",
+                    "output_intrinsic": undistortion["intrinsic"].tolist(),
+                },
                 "conditioning": [item for item in camera_records if item["role"] == "conditioning"],
                 "heldout": [item for item in camera_records if item["role"] == "heldout"],
             },
         )
-    if scans_valid:
-        reference_dir = unit_dir / "reference" / "individual_scans"
-        with ZipFile(scans_archive) as archive:
-            names = safe_zip_names(archive)
-            for name in names:
-                if Path(name).suffix.lower() != ".ply":
-                    continue
-                path = reference_dir / Path(name).name
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes(archive.read(name))
-                reference_paths.append(path)
-    if input_valid and scans_valid and alignment_valid:
-        status = "blocked-adapter"
-        blocker = (
-            "Official sources are complete, but camera intrinsics recovery and the "
-            "COLMAP-to-GT alignment adapter must run before evaluation."
+        reference_build = _build_tnt_reference(
+            scans_archive,
+            crop_json,
+            reference_path,
+            reference_build_path,
+            force=force,
         )
-    elif input_valid:
+        status = "prepared"
+        blocker = None
+    elif input_valid and not (scans_valid and alignment_valid):
         status = "blocked-reference-download"
-        blocker = "Official Meetingroom laser scans/alignment are quota-blocked on Google Drive."
+        blocker = "Official Meetingroom laser scans/alignment are incomplete."
+    elif input_valid:
+        status = "blocked-calibration"
+        blocker = calibration_error or "Fixed-pose Meetingroom intrinsics calibration is unavailable."
     else:
         status = "blocked-download"
         blocker = "Official source video/image/camera assets are incomplete."
-    manifest = _base_manifest(unit_id=unit_id, dataset="tanks-and-temples-training", track=dataset["track"], gt_tier=dataset["gt_tier"], capture_kind=dataset["capture_kind"], license_status=dataset["license_status"], status=status)
+
+    manifest = _base_manifest(
+        unit_id=unit_id,
+        dataset="tanks-and-temples-training",
+        track=dataset["track"],
+        gt_tier=dataset["gt_tier"],
+        capture_kind=dataset["capture_kind"],
+        license_status=dataset["license_status"],
+        status=status,
+    )
     manifest_path = _manifest_path(output, unit_id)
+    source_paths = [
+        *input_required,
+        *([scans_archive] if scans_valid else []),
+        *([alignment] if alignment_valid else []),
+        *([intrinsics_artifact] if intrinsics_artifact.is_file() else []),
+    ]
     manifest.update(
         {
-            "source": {"scene_id": "Meetingroom", "records": _write_source_records([*input_required, *([scans_archive] if scans_valid else []), *([alignment] if alignment_valid else [])]) if input_valid else []},
+            "source": {
+                "scene_id": "Meetingroom",
+                "records": _write_source_records(source_paths) if input_valid else [],
+            },
             "input": {
                 "conditioning_views": [item["rgb"] for item in camera_records if item["role"] == "conditioning"],
                 "heldout_views": [item["rgb"] for item in camera_records if item["role"] == "heldout"],
                 "source_video": str(video.resolve()),
                 "image_archive": str(images.resolve()),
                 "cameras": relpath(unit_dir / "cameras.json", manifest_path.parent) if camera_records else None,
-                "pose_source": "official-training-COLMAP-camera-log" if camera_records else "blocked",
+                "pose_source": (
+                    "official-training-COLMAP-log transformed by official Sim(3)"
+                    if camera_records
+                    else "blocked"
+                ),
+                "intrinsics_source": (
+                    "fixed-official-pose track calibration"
+                    if calibration_valid
+                    else "blocked"
+                ),
             },
             "reference": {
                 "kind": "pointcloud",
-                "paths": [relpath(path, manifest_path.parent) for path in reference_paths],
+                "paths": [relpath(reference_path, manifest_path.parent)] if reference_build else [],
                 "alignment_file": relpath(alignment, manifest_path.parent) if alignment_valid else None,
                 "official_crop_json": relpath(crop_json, manifest_path.parent) if crop_json.is_file() else None,
-                "roi": "official-training-crop",
-                "source_type": "prealigned-individual-laser-scans",
+                "roi": "official-training-SelectionPolygonVolume",
+                "scope": "official-crop-global-reference",
+                "source_type": "official-prealigned-individual-laser-scans",
+                "generation": reference_build,
             },
             "evaluation": {
-                "alignment": "official-training-alignment" if alignment_valid else "blocked",
+                "alignment": "official-COLMAP-to-laser-GT-Sim3" if alignment_valid else "blocked",
+                "pose_track": "GT-pose-official-alignment",
                 "limitations": [
-                    "Official camera log omits intrinsics; they must be recovered from COLMAP before GenRecon input adaptation.",
-                    "The source remains outside the common metric table until official GT and alignment downloads validate.",
+                    "The official log omits exact intrinsics; shared SIMPLE_RADIAL intrinsics are recovered from all 371 image tracks with official poses held fixed.",
+                    "Heldout RGB is disjoint from the 8 conditioning views but contributed to intrinsics calibration and the official global COLMAP trajectory; it is not geometry-independent heldout.",
+                    "The common point-cloud metrics under the official-crop scope are not a replacement for the official Tanks and Temples evaluator.",
+                    "The laser reference is used only for evaluation, never as GenRecon conditioning geometry.",
                 ],
             },
             "prediction_mesh": None,
@@ -1093,6 +1577,7 @@ def validate(output: Path, plan: dict[str, Any]) -> dict[str, Any]:
                     except Exception as exc:
                         errors.append(f"invalid {role} image for {row['unit_id']}: {path}: {exc}")
             camera_value = manifest["input"].get("cameras")
+            camera_split = None
             if camera_value:
                 camera_path = (manifest_path.parent / camera_value).resolve()
                 try:
@@ -1105,6 +1590,47 @@ def validate(output: Path, plan: dict[str, Any]) -> dict[str, Any]:
                         raise CalibrationBuildError("camera split count does not match input views")
                 except Exception as exc:
                     errors.append(f"invalid camera split for {row['unit_id']}: {camera_path}: {exc}")
+            if manifest["dataset"] == "tanks-and-temples-training":
+                try:
+                    if manifest["reference"].get("scope") != "official-crop-global-reference":
+                        raise CalibrationBuildError("unexpected T&T reference scope")
+                    if manifest["evaluation"].get("pose_track") != "GT-pose-official-alignment":
+                        raise CalibrationBuildError("unexpected T&T pose track")
+                    if camera_split is None or camera_split.get("world_frame") != "official laser GT frame":
+                        raise CalibrationBuildError("T&T cameras are not in the laser GT frame")
+                    all_cameras = camera_split["conditioning"] + camera_split["heldout"]
+                    source_indices = [item["source_index"] for item in all_cameras]
+                    if len(source_indices) != 16 or len(set(source_indices)) != 16:
+                        raise CalibrationBuildError("T&T camera split source indices overlap")
+                    for camera in all_cameras:
+                        pose = np.asarray(camera["camera_to_world"], dtype=np.float64)
+                        intrinsic = np.asarray(camera["intrinsics"], dtype=np.float64)
+                        if (
+                            pose.shape != (4, 4)
+                            or intrinsic.shape != (3, 3)
+                            or not np.isfinite(pose).all()
+                            or not np.isfinite(intrinsic).all()
+                            or not np.allclose(pose[3], [0.0, 0.0, 0.0, 1.0], atol=1e-9)
+                            or intrinsic[0, 0] <= 0.0
+                            or intrinsic[1, 1] <= 0.0
+                        ):
+                            raise CalibrationBuildError("invalid T&T camera matrix")
+                    generation = manifest["reference"].get("generation", {})
+                    if generation.get("stats", {}).get("exported_points") != 10_321_864:
+                        raise CalibrationBuildError("unexpected T&T reference point count")
+                    calibration_path = (
+                        camera_path.parent / camera_split["intrinsics_artifact"]
+                    ).resolve()
+                    calibration_document = load_json(calibration_path)
+                    if (
+                        calibration_document.get("schema_version") != 2
+                        or calibration_document.get("result") != "pass"
+                        or calibration_document.get("protocol", {}).get("revision")
+                        != "v2-single-thread-geometry"
+                    ):
+                        raise CalibrationBuildError("invalid T&T calibration artifact")
+                except Exception as exc:
+                    errors.append(f"invalid T&T package contract for {row['unit_id']}: {exc}")
             for value in manifest["reference"]["paths"]:
                 path = (manifest_path.parent / value).resolve()
                 if not path.is_file() or path.stat().st_size == 0:
@@ -1212,7 +1738,11 @@ def main() -> int:
         if "dtu-mvs" in selected:
             rows.extend(prepare_dtu(plan, output, source_root, force=args.force))
         if "tanks-and-temples-training" in selected:
-            rows.extend(prepare_tanks_and_temples(plan, output, source_root))
+            rows.extend(
+                prepare_tanks_and_temples(
+                    plan, output, source_root, force=args.force
+                )
+            )
         if "omniobject3d" in selected:
             rows.extend(prepare_omni_blockers(plan, output))
         if selected != set(plan["datasets"]):

@@ -64,6 +64,19 @@
       "official_checksums": {
         "Meetingroom.mp4_md5": "5beeb4e21ca5b8fda31235cf15972393",
         "Meetingroom.zip_md5": "754932b99adcfc602908c5bda917c5a3"
+      },
+      "frozen_import_sha256": {
+        "Meetingroom_individual_scans.zip": "2653a0849c7e8023c4280f041777977409c26f5d1c3f2f3f6238f91e8d7227f6",
+        "Meetingroom_alignment.txt": "fed12060a3f347e1eaf4a806c43966cf5972cd1dfc6032a4e412a814eda7392f"
+      },
+      "frozen_derived_sha256": {
+        "Meetingroom_intrinsics.json": "efa8dcdc70f81361c8ff5b17384d63fc157fa7d523429674cf1f067d183c72b0"
+      },
+      "adapter": {
+        "intrinsics": "shared-simple-radial-fixed-official-pose-ba",
+        "input_camera_model": "undistorted-pinhole",
+        "world_frame": "official-laser-gt-frame",
+        "reference": "official-crop-global-1cm-voxel-pointcloud"
       }
     },
     "seven-scenes": {
