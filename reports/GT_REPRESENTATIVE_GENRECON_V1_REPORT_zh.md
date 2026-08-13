@@ -2,29 +2,30 @@
 
 ## 1. 结论
 
-本轮为 GT calibration v1 中四个此前缺失 prediction 的代表单元完成统一 GenRecon 推理：
+本轮为 GT calibration v1 的五个代表单元完成统一 GenRecon 推理：
 
 - Tanks and Temples `Meetingroom`；
 - 7-Scenes `chess`；
 - Redwood `livingroom`；
-- DTU `scan24`。
+- DTU `scan24`；
+- OmniObject3D `bottle_045`。
 
-四项均属于 `GT-pose-foundation-pseudo-geometry` prediction-generation track。每项只读取冻结的 8 张 conditioning RGB、unit manifest 和 conditioning camera records；不读取 heldout RGB、conditioning/heldout depth、evaluation reference geometry，也不执行 GT geometry ICP。VGGT-1B 从 conditioning RGB 产生 pseudo geometry，再仅以 conditioning camera centers 做 Umeyama Sim(3)，映射到 metric z-up work frame 供 GenRecon 使用。
+五项均属于 `GT-pose-foundation-pseudo-geometry` prediction-generation track。每项只读取冻结的 8 张 conditioning RGB、unit manifest 和 conditioning camera records；不读取 heldout RGB、conditioning/heldout depth、evaluation reference geometry，也不执行 GT geometry ICP。VGGT-1B 从 conditioning RGB 产生 pseudo geometry，再仅以 conditioning camera centers 做 Umeyama Sim(3)，映射到保持声明坐标单位的 z-up work frame供 GenRecon 使用。
 
 最终结果：
 
-- 4/4 input packages 完成；
-- 4/4 zero-fallback preflight 通过；
-- 40/40 GenRecon chunks 非空，0 closest-camera fallback；
-- 4/4 PLY + PBR GLB official-frame packages 完整；
-- 合计 33,090,484 vertices、69,432,804 faces；
-- official-frame PLY 合计 1,498,256,412 bytes；
-- official-frame PBR GLB 合计 1,273,596,236 bytes；
+- 5/5 input packages 完成；
+- 5/5 zero-fallback preflight 通过；
+- 44/44 GenRecon chunks 非空，0 closest-camera fallback；
+- 5/5 PLY + PBR GLB official-frame packages 完整；
+- 合计 33,225,770 vertices、69,705,754 faces；
+- official-frame PLY 合计 1,504,240,219 bytes；
+- official-frame PBR GLB 合计 1,320,828,140 bytes；
 - conditioning-only inference validator 与通用 GenRecon asset validator 均为 `pass`、`errors=[]`；
-- 4/4 已登记到 GT registry 并完成统一 geometry evaluation；
-- 4/4 已进入同相机三栏视频 release。
+- 5/5 已登记到 GT registry 并完成统一 geometry evaluation；
+- 5/5 已进入同相机三栏视频 release。
 
-技术 validator 的 `pass` 只证明输入合同、资产结构、哈希、坐标变换和审计链有效，不证明几何或视觉正确。DTU `scan24` 虽然 F@10 cm 为 0.935098，但 prediction 中存在大面积绿色/白色背景平面并遮挡建筑，属于实际 hallucination。
+技术 validator 的 `pass` 只证明输入合同、资产结构、哈希、坐标变换和审计链有效，不证明几何或视觉正确。DTU `scan24` 虽然 F@10 cm 为 0.935098，但 prediction 中存在大面积绿色/白色背景平面。Omni `bottle_045` 的最终 masked prediction 不再生成旧的全画面平面，但瓶盖和瓶身塌缩成两个分离扁平 patch，仍是严重 topology/completion failure。
 
 ## 2. 冻结输入合同
 
@@ -40,9 +41,10 @@
 - prefilter budget 250,000；
 - 最多 100,000 pseudo points；
 - conditioning-camera-only Umeyama Sim(3)；
-- work frame 为 metric z-up；
+- work frame 保持 unit 声明的坐标单位，并由 conditioning cameras/pseudo points 构造 z-up；
 - GenRecon 每 chunk 使用 8 views；
 - zero closest-camera fallback；
+- room/meter track 的 projected chunk area gate 为 0.4；Omni normalized-object track 为显式 0.2；
 - PBR texture size 4096；
 - 每 chunk simplify threshold 300,000；
 - official-frame package 同时提供 PLY 和 GLB。
@@ -64,6 +66,8 @@
 - `rgb/000.png` 到 `rgb/007.png`。
 
 Unit manifest 的 conditioning-contract SHA 排除 registry-only 的 `prediction_mesh` 和 `prediction_provenance` 字段，避免 prediction registration 形成自引用循环。规范化 GenRecon input-contract SHA 排除 runtime、GPU peak、checkpoint 本机路径和 unit registration-only 字段，但保留模型/checkpoint SHA、camera、points、work frame 和 11 个 conditioning asset hashes。
+
+Omni 的白底不能作为 scene geometry。最终 adapter 只从 8 张 conditioning RGB 推导“边界连通精确白色背景”mask，同时用于 VGGT valid mask 和 GenRecon RGBA alpha；不读取 depth、heldout RGB 或 reference。Preflight/reconstruct 的每个 chunk 还记录 selected camera 的 projected chunk area、selection mode 和 threshold，package 对 `args.json` 与 `cameras.json` 做 SHA256 binding。
 
 ## 3. 模型与 checkpoint
 
@@ -92,8 +96,11 @@ VGGT-Omega checkpoint 当前需要 gated Hugging Face 授权，本轮没有绕�
 | 7-Scenes chess | P-B | 99,995 | 0.970152 | 0.971036 | 0.999090 | 0.999950 | 0.017336 | 4.0993 deg | 95,760 | 4 | 0 |
 | Redwood livingroom | P-C marginal | 97,515 | 0.008316 | 0.012404 | 0.670429 | 0.975150 | 0.137410 | 8.0641 deg | 95,419 | 14 | 0 |
 | DTU scan24 | P-B | 100,000 | 0.936000 | 0.936144 | 0.999846 | 1.000000 | 0.002612 | 0.5502 deg | 92,567 | 2 | 0 |
+| Omni bottle_045 | P-B | 88,489 | 0.969817 | 1.000000 | 0.969817 | 1.000000 | 0.004126 | 1.2427 deg | 84,451 | 4 | 0 |
 
 Redwood 使用冻结的 low-overlap gate：overlap opportunity 不高于 5%、verified points 至少 1,000、conditional consistency 至少 50%。其 250,000 个 prefiltered points 中只有 3,101 个存在跨视图 overlap opportunity，2,079 个通过验证；因此全局 verified fraction 很低，但 conditional consistency 为 0.670429。该结果只能标为 `P-C marginal`，不能写成高精度 pseudo geometry。
+
+Omni 的 object-scale chunk cube 在 8 张 conditioning cameras 下 projected area 为 0.240479–0.351257，低于 room-scale 默认 gate 0.4，因此默认 selector 会错误产生 4 个 fallback。最终协议显式使用 0.2；4 个 selected chunk/camera areas 为 0.240479–0.345289，全部通过 frustum + area gate，fallback 为 0。该阈值和逐 chunk 证据在 preflight、reconstruct args/cameras 和 package source hashes 中绑定。
 
 `P-B/P-C` 是 foundation pseudo geometry initialization 等级，不是几何精度等级。跨视图 consistency 也是模型内部自洽检查，不是独立 GT 精度证据。
 
@@ -102,7 +109,8 @@ Conditioning-manifest contract SHA256：
 - T&T：`102ab636aa000664db38967afa1b966221a5ddad1c0741e7df8d5bc0040de52c`；
 - 7-Scenes：`b088f62a3be957238dcee2b23feca254a7182bbeeec5aa194708e73baec2cf5e`；
 - Redwood：`f9be63f6ffd887e8ba2df700fcec5c401f2a886914551cff5f6b98afb32e85f4`；
-- DTU：`2f70bc5f97f4795c021e7ddd53f93c7730bc87238ab642f6d930975c7e119107`。
+- DTU：`2f70bc5f97f4795c021e7ddd53f93c7730bc87238ab642f6d930975c7e119107`；
+- Omni：`26de211d473c3ed852da24dd762081c7d4bc23fe73acd523f7c5cac0a98af104`。
 
 ## 5. GenRecon 与 official-frame packages
 
@@ -112,7 +120,8 @@ Conditioning-manifest contract SHA256：
 | 7-Scenes chess | 3,048,268 | 6,445,930 | 138,666,225 | 144,425,340 | 279.022 | 242.330 | 4,198 / 4,592 |
 | Redwood livingroom | 10,692,948 | 22,579,552 | 486,007,553 | 439,503,980 | 695.795 | 1,048.528 | 9,762 / 5,780 |
 | DTU scan24 | 1,715,268 | 3,505,858 | 76,451,289 | 63,564,340 | 168.998 | 167.613 | 3,256 / 4,356 |
-| **总计** | **33,090,484** | **69,432,804** | **1,498,256,412** | **1,273,596,236** | **2,138.733** | **2,269.338** | **10,258 / 6,524 max** |
+| Omni bottle_045 | 135,286 | 272,950 | 5,983,807 | 47,231,904 | 144.919 | 59.470 | 3,216 / 4,672 |
+| **总计** | **33,225,770** | **69,705,754** | **1,504,240,219** | **1,320,828,140** | **2,283.652** | **2,328.808** | **10,258 / 6,524 max** |
 
 Official-frame PLY 实际改写 vertices；PBR GLB 则添加同一 `work_to_official` 4x4 根节点。Package validator 同时检查 work-frame PLY/GLB、official-frame PLY/GLB、矩阵、source hashes、output hashes、input-contract SHA，以及 no-reference/no-heldout/no-GT-ICP 声明。
 
@@ -120,12 +129,13 @@ Official output SHA256：
 
 | Unit | PLY SHA256 | PBR GLB SHA256 | Package manifest SHA256 |
 |---|---|---|---|
-| T&T Meetingroom | `636f896bf1992be71f239bfeb9f9c3a623ef249a0b967f71c52869322aa94056` | `f5892fe6db5740d4a668396e88b01a0b65e2ae538e52c0e7f1ecf62d55b77ee1` | `928da03d421205c57a9a5d237be2895ece2cc23f634e4e9f39b007abee27d507` |
-| 7-Scenes chess | `fdd4f45535c701dc9e1e99865ff8eacd3f1707c9cc6f5417836e78431f05f8d4` | `6b4678365fcc1d7a138625d94f836e7818722471682cedd49b1a51c10c9b24e6` | `32b437a3f1298f61e409db942b2920c5dae45b2d5446b9970c46b88186399a5f` |
-| Redwood livingroom | `e41e9522b3103584ac8e4e8f5736f974bea32c1e7f02340f302d00f420be295c` | `260b673785ce1c52507fea4f8df9ba3f5efddff3e0d199631e4c94afa1b77318` | `ea048909882942bad7e71205cad03c232e12328f1bde5aae0c6f1be3682a6377` |
-| DTU scan24 | `5616f9304e9bf924e099535471bc09aceea1e113f273eecd1664fdc6f1e78a39` | `0e77fb85ba2585163da31cd3b5baefc5723de17b2549a83674e0931c0f7eb1ef` | `adecc84a52260ea5ac184156dc16743ea40a6eaa86cadf3403b4a8b28167f72c` |
+| T&T Meetingroom | `636f896bf1992be71f239bfeb9f9c3a623ef249a0b967f71c52869322aa94056` | `f5892fe6db5740d4a668396e88b01a0b65e2ae538e52c0e7f1ecf62d55b77ee1` | `d0e75d9a2e69baed59a7524075133120f694514e5ad333f1e20caf00efcf62d9` |
+| 7-Scenes chess | `fdd4f45535c701dc9e1e99865ff8eacd3f1707c9cc6f5417836e78431f05f8d4` | `6b4678365fcc1d7a138625d94f836e7818722471682cedd49b1a51c10c9b24e6` | `a6aa6b33a51255f14625f134506dbe6f3f74704e201d0f5bba3db1830f307503` |
+| Redwood livingroom | `e41e9522b3103584ac8e4e8f5736f974bea32c1e7f02340f302d00f420be295c` | `260b673785ce1c52507fea4f8df9ba3f5efddff3e0d199631e4c94afa1b77318` | `93d9d7bf3e17ca9fdb9c9f9e3d914a3f8deefc82e9aed0504b10b30261e55398` |
+| DTU scan24 | `5616f9304e9bf924e099535471bc09aceea1e113f273eecd1664fdc6f1e78a39` | `0e77fb85ba2585163da31cd3b5baefc5723de17b2549a83674e0931c0f7eb1ef` | `cd8653fb684c3a8959b587ec5d21ffeb1b116b7261c3e061db35e3d5b44056cd` |
+| Omni bottle_045 | `0f7159af685ff7c27065fbcc9feb027ab361b8a27593530da3c59730bab8b55d` | `b1a9ad19c585878b785d067a1ddaddeab94ec441a59f8ffb19d0daecbdb1a796` | `136b9d631697c52f46267bb0b55ce0075718f93c63fe57de29dcf542bb746914` |
 
-多轮 deterministic replay 中，4 个单元的 44 个实际 GenRecon input hashes 和 8 个 official PLY/GLB hashes 均保持不变。
+五个 package 均绑定 input-contract、work mesh/GLB、reconstruct `args.json` 和 `cameras.json` hashes；normalized-object Omni 还强制 preflight/reconstruction camera JSON 完全相同。四个原有单元的 44 个实际 GenRecon input hashes 和 8 个 official PLY/GLB hashes 已在历史 deterministic replay 中保持不变；本轮仅扩展 package source-chain metadata，几何 PLY/GLB hashes 未变。5-unit resumability replay 中全部 reconstruction/GLB/package 被识别为 current 并跳过。
 
 ## 6. 分轨 geometry evaluation
 
@@ -136,25 +146,31 @@ Official output SHA256：
 | Redwood livingroom | G2 synthetic exact | raw-global | 0.169891 | 0.392519 | 0.281205 | 0.066537 | 0.192308 | 0.335949 |
 | DTU scan24 | O0 instance scan | raw-global | 0.051826 | 0.047409 | 0.049617 | 0.174609 | 0.553768 | 0.935098 |
 
-四个 reference 都是 point-cloud evaluation backend 且没有可审计 surface normals，因此 normal consistency 为 `null`，没有伪填 0。
+四个 meter-coordinate reference 都是 point-cloud evaluation backend 且没有可审计 surface normals，因此 normal consistency 为 `null`，没有伪填 0。
 
-禁止对四行直接求总均值：T&T 使用独立 official-crop protocol，四者 GT tier 不同，scene/instance unit type 也不同。统一 evaluation index 以 `protocol_groups`、`tracks_by_tier` 和 `prediction_tracks_by_tier` 分离汇总。22 个 legacy G0 predictions 明确标为 `prediction-provenance-not-recorded`，不猜测其 generation track，也不与新增四项混成同一 prediction-track 均值。
+禁止对四行直接求总均值：T&T 使用独立 official-crop protocol，四者 GT tier 不同，scene/instance unit type 也不同。Omni 单列 normalized-object protocol：
+
+| Unit | GT tier | Scope | Accuracy | Completeness | Normalized Chamfer | F@bbox 0.5% | F@bbox 1% | F@bbox 2% |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| Omni bottle_045 | O0 instance scan | normalized-object-global-reference | 0.108910 | 0.289282 | 0.199096 | 0.012049 | 0.025558 | 0.058624 |
+
+Omni 不生成 meter-labelled metrics。2% precision 为 0.217820，但 recall 仅 0.033870；同相机 render 显示瓶盖和瓶身塌缩为两个分离扁平 patch。统一 evaluation index 以 `protocol_groups`、`tracks_by_tier` 和 `prediction_tracks_by_tier` 分离汇总。22 个 legacy G0 predictions 明确标为 `prediction-provenance-not-recorded`，不猜测其 generation track。
 
 ## 7. 同相机视觉审查
 
-6 个代表场景已有真实 prediction 第三栏；OmniObject3D `bottle_045` 作为第七个 prepared 代表展示真实 RGB/reference，并以显式状态卡占据第三栏。最终视频 release：
+7 个代表场景均有真实 registry-backed prediction 第三栏。最终视频 release：
 
 - 7 datasets：7 available、0 blocked；
-- 6 个有 prediction，1 个 `missing-prediction`；
+- 7 个有 prediction、0 个 `missing-prediction`；
 - 112 frozen camera frames；
 - 29 H.264/yuv420p videos；
 - 560 decoded frames；
-- 54,100,208 video bytes；
+- 54,679,055 video bytes；
 - reference coverage min/median/max：0.0460/0.8414/0.9988；
-- prediction coverage min/median/max：0.2746/0.7702/1.0000；
+- prediction coverage min/median/max：0.0078/0.7339/1.0000；
 - release validation：`pass`、`errors=[]`。
 
-T&T、7-Scenes 和 Redwood 的 conditioning/heldout 检查中，相机方向与主要房间结构同位。DTU 相机方向也正确，但 prediction 有大面积绿色/白色背景面，且从多个冻结视角遮挡建筑主体。这一 hallucination 必须与 F@10 cm 0.935098 同时报告。
+T&T、7-Scenes 和 Redwood 的 conditioning/heldout 检查中，相机方向与主要房间结构同位。DTU 相机方向也正确，但 prediction 有大面积绿色/白色背景面。Omni 的旧全画面平面在 RGB-derived mask 后消失，但 16 个视角都只看到分离的 cap/body patches；其 prediction coverage 为 0.0078–0.0506，明显低于多数 reference 视角的约 0.09–0.12，与低 completion/recall 一致。
 
 Render coverage、nonblank frame 和视觉同位只用于发现空帧、相机错位或异常包围，不是 F-score、recall、完整度或视觉质量结论。
 
@@ -162,40 +178,40 @@ Render coverage、nonblank frame 和视觉同位只用于发现空帧、相机�
 
 `inference_validation.json`：
 
-- 4 units；
-- 32 conditioning RGB；
-- 397,510 pseudo points；
-- 40 chunks；
-- 4 prediction packages；
-- 33,090,484 prediction vertices；
-- 1,498,256,412 prediction mesh bytes；
-- 1,273,596,236 prediction GLB bytes；
-- 42 strict JSON files；
+- 5 units；
+- 40 conditioning RGB；
+- 485,999 pseudo points；
+- 44 chunks；
+- 5 prediction packages；
+- 33,225,770 prediction vertices；
+- 1,504,240,219 prediction mesh bytes；
+- 1,320,828,140 prediction GLB bytes；
+- 51 strict JSON files；
 - result `pass`，`errors=[]`。
 
 通用 GenRecon asset validation：
 
-- 4/4 reconstruct complete；
-- 4/4 GLB complete；
-- 40 nonempty primitives；
+- 5/5 reconstruct complete；
+- 5/5 GLB complete；
+- 44 nonempty primitives；
 - 0 empty chunks；
 - 0 fallback；
-- 69,432,804 faces；
+- 69,705,754 faces；
 - result `pass`，`errors=[]`。
 
 关键 SHA256：
 
-- inference plan：`a578dbe0597a501dad4e9d8d710a823b13ddda7b3c22ed634274c51503e07672`；
-- adapter：`89117edfb6a01f8ed897b002994ef6ac60f51bbe099183b23f7bd032f0fc3ea8`；
-- inference index：`ec73d3e2e6560a6bbb906545508165dc7de88e3811ffa74f0261a357575fb15f`；
-- general asset summary CSV：`ff1086009ef695877eaa36c4040c9c7363178cfc18c3cf6f0a520d5abb47fe3b`；
-- general asset validation：`15fa6c14f9ef7a764653362bb410098b63020bbb261edf26de7eaaab81d4d3c1`；
-- inference validation：`53fc696342bb8be325b5f73a3bd3f5688985c50a7ac827a6f316c56bca061776`；
-- GT registry：`75e7f7e19dd8d305625ab9375d95a3c4ef70c36c652ed86849a9fba503079017`；
-- evaluation index：`81ba603bd41af7bee95c8b57c2548523a862e965731813f989bc45e595298fb5`；
-- visualization release validation：`ba4e6f2dd3b25c9abf45118d90c59be2986fe796f46ae73ec38e135e75722464`。
+- inference plan：`2033b18488f392e3344eda1048cf1440ecc3b487386c70fb3b3286bac5a90e89`；
+- adapter：`492d7fdc47545dad9b740962894b7969406dd391f2f2c17acf6121da27f0ee76`；
+- inference index：`77564e8186f8dc658f2a52c76eff23fa148c742b961745d750708f4a6034538f`；
+- general asset summary CSV：`d3ebe6fa27edcf91094abf0914df949e59c9532a1b80aad302ea79ca61fef245`；
+- general asset validation：`1ab985035a3b56153b916486f89768b6f7f15372c49d502f671479dd0a167506`；
+- inference validation：`52983724fbe71e1c2196135e574205ec256f01b9c1ccd0f9882fb7d7a6104345`；
+- GT registry：`ea5ce9627e9b20ac90ae90454b7e4fcb1955d6256a1bdc1cac3f24c4250d80e0`；
+- evaluation index：`1c4ee92c5ba7ff9b0c15fa39bd1eec08b9962a2dbddc54cb43a0f1fc7e5ff707`；
+- visualization release validation：`f8de4ac55c6a11273bf69420fffb62d392522409417b8ef03f4d5c34cd109c68`。
 
-专用 inference validator 写 `inference_validation.json`；通用 GenRecon validator 写 `validation.json`，二者职责分离，互不覆盖。通用 runner 的 deterministic `index.json` 与 `validation.json` 不写墙钟字段；连续两次真实四场景 validation 的 `index.json`、`summary.csv` 和 `validation.json` SHA256 均保持一致。
+专用 inference validator 写 `inference_validation.json`；通用 GenRecon validator 写 `validation.json`，二者职责分离，互不覆盖。通用 runner 的 deterministic `index.json` 与 `validation.json` 不写墙钟字段；四个历史场景保留既有 deterministic replay 证据，最终 5-unit resumability replay 则验证了 command/profile 一致性并全部跳过重建。
 
 ## 9. 复现入口
 
@@ -241,4 +257,4 @@ EGL_PLATFORM=surfaceless .venv/bin/python \
 7. Redwood 是 `P-C marginal` low-overlap case，不能将 conditional consistency 写成绝对几何精度。
 8. DTU 的背景平面 hallucination 是已确认视觉失败，不能由高 F-score、coverage 或 validator pass 覆盖。
 9. Observed/unobserved completion、full-GT-mask heldout RGB/depth、chunk boundary、trajectory 和 dedicated hallucination metrics 尚未实现，不能以当前空缺字段冒充已评测。
-10. 剩余 ETH3D 5、7-Scenes 6、Redwood 1、DTU 14、OmniObject3D 24，共 50 个 prepared units 仍无 prediction；Omni 还必须使用 normalized-object protocol，不能输出米制分数。
+10. 剩余 ETH3D 5、7-Scenes 6、Redwood 1、DTU 14、OmniObject3D 23，共 49 个 prepared units 仍无 prediction；Omni 必须继续使用 normalized-object protocol，不能输出米制分数。

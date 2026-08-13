@@ -1413,6 +1413,79 @@ def refresh_foundation_quality(
     return gate
 
 
+def genrecon_preflight_camera_selection_is_current(
+    preflight: dict[str, Any],
+    camera_document: dict[str, Any],
+    expected_area: float,
+) -> bool:
+    """Return whether a cached preflight matches the current area contract."""
+    try:
+        if not math.isfinite(expected_area) or not 0.0 <= expected_area <= 1.0:
+            return False
+        status = preflight.get("status")
+        fallback_count = int(preflight.get("closest_camera_fallback_count", -1))
+        selection = preflight.get("camera_selection", {})
+        chunks = camera_document.get("chunks")
+        if (
+            status not in {"passed", "marginal"}
+            or fallback_count < 0
+            or (status == "passed") != (fallback_count == 0)
+            or selection.get("policy")
+            != "frustum-and-minimum-projected-chunk-area"
+            or abs(
+                float(selection.get("minimum_projected_chunk_area", -1.0))
+                - expected_area
+            )
+            > 1e-12
+            or selection.get("required_fallback_count") != 0
+            or not isinstance(chunks, list)
+            or not chunks
+            or len(chunks) != int(preflight.get("chunk_count", -1))
+        ):
+            return False
+        areas = []
+        audited_fallbacks = 0
+        for record in chunks:
+            selected = record.get("cond2d_view", {})
+            mode = selected.get("selection_mode")
+            area = float(selected.get("projected_chunk_area", -1.0))
+            threshold = float(
+                selected.get("minimum_projected_chunk_area", -1.0)
+            )
+            if (
+                mode not in {"visible-projected-area", "closest-camera-fallback"}
+                or not math.isfinite(area)
+                or not 0.0 <= area <= 1.0
+                or abs(threshold - expected_area) > 1e-12
+                or (
+                    mode == "visible-projected-area" and area < expected_area
+                )
+                or (
+                    mode == "closest-camera-fallback" and area >= expected_area
+                )
+            ):
+                return False
+            audited_fallbacks += mode == "closest-camera-fallback"
+            areas.append(area)
+        return bool(
+            audited_fallbacks == fallback_count
+            and abs(
+                float(selection.get("selected_projected_chunk_area_min", -1.0))
+                - min(areas)
+            )
+            <= 1e-12
+            and abs(
+                float(selection.get("selected_projected_chunk_area_max", -1.0))
+                - max(areas)
+            )
+            <= 1e-12
+            and selection.get("selected_chunks_meeting_area_gate")
+            == sum(area >= expected_area for area in areas)
+        )
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
 def run_genrecon_preflight(
     candidate: dict[str, Any], output_root: Path, args: argparse.Namespace
 ) -> dict[str, Any]:
@@ -1421,16 +1494,37 @@ def run_genrecon_preflight(
     manifest_path = scene_dir / "manifest.json"
     if not manifest_path.is_file():
         return {"candidate_id": identifier, "status": "missing_foundation_output"}
+    manifest = json.loads(manifest_path.read_text())
+    min_projected_chunk_area = float(
+        manifest.get("genrecon_camera_selection", {}).get(
+            "minimum_projected_chunk_area", 0.4
+        )
+    )
+    if (
+        not math.isfinite(min_projected_chunk_area)
+        or not 0.0 <= min_projected_chunk_area <= 1.0
+    ):
+        raise ValueError("minimum_projected_chunk_area must be finite and in [0, 1]")
     preflight_dir = scene_dir / "genrecon_preflight"
     status_path = preflight_dir / "preflight.json"
     if status_path.is_file() and not args.force_preflight:
         previous = json.loads(status_path.read_text())
-        if previous.get("status") in {"passed", "marginal"}:
+        cameras_path = preflight_dir / "cameras.json"
+        camera_document = (
+            json.loads(cameras_path.read_text()) if cameras_path.is_file() else {}
+        )
+        if genrecon_preflight_camera_selection_is_current(
+            previous, camera_document, min_projected_chunk_area
+        ):
             print(
                 f"[{identifier}] GenRecon preflight already {previous['status']}", flush=True
             )
             return previous
-    if args.force_preflight and preflight_dir.exists():
+        print(
+            f"[{identifier}] cached GenRecon preflight is stale; rebuilding",
+            flush=True,
+        )
+    if preflight_dir.exists():
         shutil.rmtree(preflight_dir)
     preflight_dir.mkdir(parents=True, exist_ok=True)
     start = time.monotonic()
@@ -1443,21 +1537,66 @@ def run_genrecon_preflight(
             centers, original_to_chunks, _, _ = IphoneChunker(
                 colmap_subdir="colmap_vggt"
             ).get_chunks(scene_dir, preflight_dir)
-            selected = IphoneImageSelecter(center_crop=False).get_images(
+            selected = IphoneImageSelecter(
+                center_crop=False,
+                min_projected_chunk_area=min_projected_chunk_area,
+            ).get_images(
                 original_to_chunks,
                 scene_dir / "colmap_vggt" / "cameras.txt",
-                min(args.genrecon_views, len(json.loads(manifest_path.read_text())["views"])),
+                min(args.genrecon_views, len(manifest["views"])),
                 preflight_dir,
                 seed=args.seed,
             )
         log = captured.getvalue()
         (preflight_dir / "preflight.log").write_text(log)
         fallback_count = log.count("falling back to closest camera")
+        camera_document = json.loads((preflight_dir / "cameras.json").read_text())
+        chunk_camera_records = [
+            item["cond2d_view"] for item in camera_document["chunks"]
+        ]
+        projected_areas = [
+            float(item["projected_chunk_area"]) for item in chunk_camera_records
+        ]
+        camera_selection_valid = (
+            len(chunk_camera_records) == len(centers)
+            and all(
+                item.get("selection_mode")
+                in {"visible-projected-area", "closest-camera-fallback"}
+                and abs(
+                    float(item.get("minimum_projected_chunk_area", -1.0))
+                    - min_projected_chunk_area
+                )
+                <= 1e-12
+                and (
+                    (
+                        item.get("selection_mode") == "visible-projected-area"
+                        and float(item.get("projected_chunk_area", -1.0))
+                        >= min_projected_chunk_area
+                    )
+                    or (
+                        item.get("selection_mode") == "closest-camera-fallback"
+                        and 0.0
+                        <= float(item.get("projected_chunk_area", -1.0))
+                        < min_projected_chunk_area
+                    )
+                )
+                for item in chunk_camera_records
+            )
+            and sum(
+                item.get("selection_mode") == "closest-camera-fallback"
+                for item in chunk_camera_records
+            )
+            == fallback_count
+        )
         import trimesh
 
         clean_cloud = trimesh.load(preflight_dir / "clean_points.ply", process=False)
         clean_point_count = int(len(clean_cloud.vertices))
-        usable = bool(centers) and clean_point_count >= 500
+        usable = (
+            bool(centers)
+            and clean_point_count >= 500
+            and camera_selection_valid
+        )
         preflight_status = (
             "passed" if usable and fallback_count == 0 else "marginal" if usable else "failed"
         )
@@ -1474,6 +1613,20 @@ def run_genrecon_preflight(
             "scene_image_crop_count": int(selected.scene_images_512.shape[0]),
             "condition_view_count": len(selected.cond2d_images_512),
             "condition_chunk_indices": selected.chunk_indices,
+            "camera_selection": {
+                "policy": "frustum-and-minimum-projected-chunk-area",
+                "minimum_projected_chunk_area": min_projected_chunk_area,
+                "required_fallback_count": 0,
+                "selected_projected_chunk_area_min": (
+                    min(projected_areas) if projected_areas else None
+                ),
+                "selected_projected_chunk_area_max": (
+                    max(projected_areas) if projected_areas else None
+                ),
+                "selected_chunks_meeting_area_gate": sum(
+                    area >= min_projected_chunk_area for area in projected_areas
+                ),
+            },
             "closest_camera_fallback_count": fallback_count,
             "alpha_mask_zero_fraction_512": float(
                 np.mean(selected.scene_images_512.numpy() == 0)
@@ -1482,7 +1635,9 @@ def run_genrecon_preflight(
         if result["status"] == "marginal":
             result["warning"] = "One or more chunks used closest-camera fallback"
         elif result["status"] == "failed":
-            result["error"] = "No usable chunks or fewer than 500 clean points"
+            result["error"] = (
+                "No usable chunks, fewer than 500 clean points, or invalid camera-selection audit"
+            )
         write_json(status_path, result)
         print(
             f"[{identifier}] preflight={result['status']} clean={clean_point_count} "

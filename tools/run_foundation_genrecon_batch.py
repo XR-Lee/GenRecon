@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import struct
 import subprocess
 from pathlib import Path
@@ -131,7 +132,12 @@ def profile_artifact_record(
     )
 
 
-def profile_is_complete(profile_path: Path, expected_files: list[Path]) -> bool:
+def profile_is_complete(
+    profile_path: Path,
+    expected_files: list[Path],
+    *,
+    expected_command: list[str] | None = None,
+) -> bool:
     if not profile_path.is_file():
         return False
     try:
@@ -139,6 +145,8 @@ def profile_is_complete(profile_path: Path, expected_files: list[Path]) -> bool:
     except (OSError, ValueError, json.JSONDecodeError):
         return False
     if profile.get("success") is not True or profile.get("return_code") != 0:
+        return False
+    if expected_command is not None and profile.get("command") != expected_command:
         return False
     records = {
         str(Path(item.get("path", "")).resolve()): item
@@ -160,6 +168,7 @@ def reconstruct_command(
     colmap_subdir: str = "colmap_vggt",
     max_reproj_error: float | None = None,
     min_track_len: int | None = None,
+    min_projected_chunk_area: float = 0.4,
 ) -> list[str]:
     command = [
         str(ROOT / ".venv" / "bin" / "python"),
@@ -202,6 +211,10 @@ def reconstruct_command(
         command.extend(["--max_reproj_error", f"{max_reproj_error:g}"])
     if min_track_len is not None:
         command.extend(["--min_track_len", str(min_track_len)])
+    if min_projected_chunk_area != 0.4:
+        command.extend(
+            ["--min_projected_chunk_area", f"{min_projected_chunk_area:g}"]
+        )
     return command
 
 
@@ -303,12 +316,31 @@ def candidate_grade(candidate: dict[str, Any]) -> Any:
     return candidate.get("input_grade", candidate.get("grade", candidate.get("foundation_grade")))
 
 
+def candidate_min_projected_chunk_area(candidate: dict[str, Any], input_root: Path) -> float:
+    manifest_path = input_root / "candidates" / candidate["candidate_id"] / "manifest.json"
+    manifest = load_json(manifest_path)
+    value = float(
+        manifest.get("genrecon_camera_selection", {}).get(
+            "minimum_projected_chunk_area", 0.4
+        )
+    )
+    if not 0.0 <= value <= 1.0:
+        raise ValueError(
+            f"Invalid minimum_projected_chunk_area in {manifest_path}: {value}"
+        )
+    return value
+
+
 def inspect_candidate(
     candidate: dict[str, Any],
     input_root: Path,
     output_root: Path,
     report_root: Path,
     track_name: str = "foundation-sfm",
+    *,
+    colmap_subdir: str = "colmap_vggt",
+    max_reproj_error: float | None = None,
+    min_track_len: int | None = None,
 ) -> dict[str, Any]:
     identifier = candidate["candidate_id"]
     paths = candidate_paths(identifier, input_root, output_root, report_root)
@@ -320,8 +352,25 @@ def inspect_candidate(
         reconstruction / "to_glb_inputs.pt",
         reconstruction / "chunk_inputs.pt",
     ]
-    reconstruct_complete = profile_is_complete(reconstruct_profile, reconstruct_artifacts)
-    glb_complete = profile_is_complete(glb_profile, [reconstruction / "scene.glb"])
+    min_projected_chunk_area = candidate_min_projected_chunk_area(candidate, input_root)
+    reconstruct_command_expected = reconstruct_command(
+        paths["input"],
+        reconstruction,
+        colmap_subdir=colmap_subdir,
+        max_reproj_error=max_reproj_error,
+        min_track_len=min_track_len,
+        min_projected_chunk_area=min_projected_chunk_area,
+    )
+    reconstruct_complete = profile_is_complete(
+        reconstruct_profile,
+        reconstruct_artifacts,
+        expected_command=reconstruct_command_expected,
+    )
+    glb_complete = profile_is_complete(
+        glb_profile,
+        [reconstruction / "scene.glb"],
+        expected_command=glb_command(reconstruction),
+    )
     record: dict[str, Any] = {
         "candidate_id": identifier,
         "title": candidate.get("title"),
@@ -431,9 +480,22 @@ def write_summary(
     output_root: Path,
     report_root: Path,
     track_name: str = "foundation-sfm",
+    *,
+    colmap_subdir: str = "colmap_vggt",
+    max_reproj_error: float | None = None,
+    min_track_len: int | None = None,
 ) -> dict[str, Any]:
     records = [
-        inspect_candidate(item, input_root, output_root, report_root, track_name)
+        inspect_candidate(
+            item,
+            input_root,
+            output_root,
+            report_root,
+            track_name,
+            colmap_subdir=colmap_subdir,
+            max_reproj_error=max_reproj_error,
+            min_track_len=min_track_len,
+        )
         for item in candidates
     ]
     summary = {
@@ -504,8 +566,21 @@ def validate_outputs(
     output_root: Path,
     report_root: Path,
     track_name: str = "foundation-sfm",
+    *,
+    colmap_subdir: str = "colmap_vggt",
+    max_reproj_error: float | None = None,
+    min_track_len: int | None = None,
 ) -> dict[str, Any]:
-    summary = write_summary(candidates, input_root, output_root, report_root, track_name)
+    summary = write_summary(
+        candidates,
+        input_root,
+        output_root,
+        report_root,
+        track_name,
+        colmap_subdir=colmap_subdir,
+        max_reproj_error=max_reproj_error,
+        min_track_len=min_track_len,
+    )
     errors: list[str] = []
     deliverable_hash_bytes = 0
     chunk_glbs_validated = 0
@@ -658,6 +733,16 @@ def run_batch(args: argparse.Namespace, candidates: list[dict[str, Any]]) -> int
                     "seed": 42,
                     "chunk_size_factor": 1.08,
                     "min_overlap_factor": 4,
+                    "camera_selection": {
+                        "policy": "per-candidate-manifest",
+                        "minimum_projected_chunk_area": {
+                            item["candidate_id"]: candidate_min_projected_chunk_area(
+                                item, args.input_root
+                            )
+                            for item in candidates
+                        },
+                        "required_fallback_count": 0,
+                    },
                     "proj_batch_voxels": 256,
                     "glb_texture_size": 4096,
                     "glb_simplify_threshold_per_chunk": 300000,
@@ -697,21 +782,31 @@ def run_batch(args: argparse.Namespace, candidates: list[dict[str, Any]]) -> int
                 flush=True,
             )
             record = {"candidate_id": identifier, "started_utc": utc_now(), "stages": {}}
-            reconstruct_ready = profile_is_complete(
-                reconstruct_profile, [mesh, to_glb, chunk_inputs]
+            min_projected_chunk_area = candidate_min_projected_chunk_area(
+                candidate, args.input_root
             )
+            reconstruct_expected_command = reconstruct_command(
+                paths["input"],
+                paths["reconstruction"],
+                colmap_subdir=args.colmap_subdir,
+                max_reproj_error=args.max_reproj_error,
+                min_track_len=args.min_track_len,
+                min_projected_chunk_area=min_projected_chunk_area,
+            )
+            reconstruct_ready = profile_is_complete(
+                reconstruct_profile,
+                [mesh, to_glb, chunk_inputs],
+                expected_command=reconstruct_expected_command,
+            )
+            reconstructed = False
             if reconstruct_ready and not args.force_reconstruct:
                 record["stages"]["reconstruct"] = "skipped_complete"
                 print(f"[{index}/{len(candidates)}] {identifier}: reconstruction already complete", flush=True)
             else:
+                shutil.rmtree(paths["reconstruction"], ignore_errors=True)
+                paths["reconstruction"].mkdir(parents=True, exist_ok=True)
                 profile = profile_command(
-                    reconstruct_command(
-                        paths["input"],
-                        paths["reconstruction"],
-                        colmap_subdir=args.colmap_subdir,
-                        max_reproj_error=args.max_reproj_error,
-                        min_track_len=args.min_track_len,
-                    ),
+                    reconstruct_expected_command,
                     cwd=ROOT,
                     log_path=paths["report"] / "reconstruct.log",
                     result_path=reconstruct_profile,
@@ -720,19 +815,29 @@ def run_batch(args: argparse.Namespace, candidates: list[dict[str, Any]]) -> int
                     label=f"{args.track_name}-genrecon-{identifier}",
                 )
                 reconstruct_ready = profile.get("success") is True
+                reconstructed = reconstruct_ready
                 record["stages"]["reconstruct"] = "complete" if reconstruct_ready else "failed"
             if not reconstruct_ready:
                 had_failure = True
                 record["stages"]["glb"] = "blocked_reconstruction_failed"
                 print(f"[{index}/{len(candidates)}] {identifier}: reconstruction failed", flush=True)
             else:
-                glb_ready = profile_is_complete(glb_profile, [scene_glb])
-                if glb_ready and not args.force_glb:
+                glb_expected_command = glb_command(paths["reconstruction"])
+                glb_ready = profile_is_complete(
+                    glb_profile,
+                    [scene_glb],
+                    expected_command=glb_expected_command,
+                )
+                if glb_ready and not args.force_glb and not reconstructed:
                     record["stages"]["glb"] = "skipped_complete"
                     print(f"[{index}/{len(candidates)}] {identifier}: GLB already complete", flush=True)
                 else:
+                    shutil.rmtree(
+                        paths["reconstruction"] / "chunks_300k", ignore_errors=True
+                    )
+                    scene_glb.unlink(missing_ok=True)
                     profile = profile_command(
-                        glb_command(paths["reconstruction"]),
+                        glb_expected_command,
                         cwd=ROOT,
                         log_path=paths["report"] / "glb.log",
                         result_path=glb_profile,
@@ -753,6 +858,9 @@ def run_batch(args: argparse.Namespace, candidates: list[dict[str, Any]]) -> int
                 args.output_root,
                 args.report_root,
                 args.track_name,
+                colmap_subdir=args.colmap_subdir,
+                max_reproj_error=args.max_reproj_error,
+                min_track_len=args.min_track_len,
             )
             write_json(args.report_root / "batch_run.json", run_state)
             if had_failure and args.fail_fast:
@@ -796,12 +904,26 @@ def main() -> int:
         return_code = run_batch(args, candidates)
     if args.stage in {"summarize", "all"}:
         summary = write_summary(
-            candidates, args.input_root, args.output_root, args.report_root, args.track_name
+            candidates,
+            args.input_root,
+            args.output_root,
+            args.report_root,
+            args.track_name,
+            colmap_subdir=args.colmap_subdir,
+            max_reproj_error=args.max_reproj_error,
+            min_track_len=args.min_track_len,
         )
         print(f"[summary] {summary['summary']}", flush=True)
     if args.stage in {"validate", "all"}:
         validation = validate_outputs(
-            candidates, args.input_root, args.output_root, args.report_root, args.track_name
+            candidates,
+            args.input_root,
+            args.output_root,
+            args.report_root,
+            args.track_name,
+            colmap_subdir=args.colmap_subdir,
+            max_reproj_error=args.max_reproj_error,
+            min_track_len=args.min_track_len,
         )
         print(f"[validation] {validation['result']} {validation['counts']}", flush=True)
         if validation["result"] != "pass":

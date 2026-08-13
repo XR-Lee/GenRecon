@@ -202,6 +202,11 @@
       "mesh": "outputs/gt-calibration-v1/representative-genrecon-v1/candidates/dtu-scan24/prediction_official/mesh.ply",
       "package_manifest": "outputs/gt-calibration-v1/representative-genrecon-v1/candidates/dtu-scan24/prediction_official/manifest.json",
       "track": "GT-pose-foundation-pseudo-geometry"
+    },
+    "omniobject3d-bottle_045": {
+      "mesh": "outputs/gt-calibration-v1/representative-genrecon-v1/candidates/omniobject3d-bottle_045/prediction_official/mesh.ply",
+      "package_manifest": "outputs/gt-calibration-v1/representative-genrecon-v1/candidates/omniobject3d-bottle_045/prediction_official/manifest.json",
+      "track": "GT-pose-foundation-pseudo-geometry"
     }
   },
   "evaluation_protocol": {

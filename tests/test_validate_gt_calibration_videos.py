@@ -45,6 +45,23 @@ def test_release_frame_totals_follow_candidate_status_contracts() -> None:
     }
 
 
+def test_visualization_plan_records_omni_prediction_failure_review() -> None:
+    import json
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    plan = json.loads(
+        (root / "configs/eval/gt_calibration_visualization_v1.json").read_text()
+    )
+    omni = next(
+        item for item in plan["datasets"]
+        if item["unit_id"] == "omniobject3d-bottle_045"
+    )
+    assert omni["review_status"] == "severe-fragmented-incomplete-reconstruction"
+    assert "detached flattened patches" in omni["review_note"]
+    assert "0.058624" in omni["review_note"]
+
+
 def test_frozen_role_order_is_conditioning_then_heldout() -> None:
     assert expected_role_order() == [
         *(('conditioning', index) for index in range(8)),

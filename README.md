@@ -244,15 +244,24 @@ professional scan is normalized into the audited render frame, and depth EXRs
 remain audit-only rather than GenRecon conditioning. Tanks and Temples
 Meetingroom includes the official individual scans/alignment, fixed-pose
 intrinsics calibration, undistorted 8+8 inputs, and an official-crop 1 cm laser
-reference. The registry contains 26 evaluated predictions: 22 legacy G0
-predictions plus four representative RGB-only runs for Meetingroom, 7-Scenes
-`chess`, Redwood `livingroom`, and DTU `scan24`. The remaining 50 prepared units,
-including all 24 OmniObject3D objects, are explicitly `missing-prediction`.
-Those four runs use only the frozen eight conditioning RGB images and
-conditioning camera records; VGGT-1B pseudo geometry is aligned by a
-conditioning-camera-only Sim(3), with no heldout RGB/depth, reference geometry,
-or GT ICP. Protocol scope, GT tier, scene/instance unit type, and
-prediction-generation track are never merged into one score. See
+reference. The registry contains 27 evaluated predictions: 22 legacy G0
+predictions plus five representative RGB-only runs for Meetingroom, 7-Scenes
+`chess`, Redwood `livingroom`, DTU `scan24`, and OmniObject3D `bottle_045`.
+The remaining 49 prepared units, including 23 OmniObject3D objects, are
+explicitly `missing-prediction`. Those five runs use only the frozen eight
+conditioning RGB images and conditioning camera records; VGGT-1B pseudo
+geometry is aligned by a conditioning-camera-only Sim(3), with no heldout
+RGB/depth, reference geometry, or GT ICP. OmniObject3D remains a separate
+`normalized-object` protocol. For `bottle_045`, border-connected exact-white
+background inferred from conditioning RGB is excluded from both VGGT geometry
+and GenRecon RGBA inputs. Its final masked prediction has normalized Chamfer
+0.199096 and bbox-diagonal F-scores 0.012049, 0.025558, and 0.058624 at 0.5%,
+1%, and 2%. Same-camera review shows that the earlier full-frame plane failure
+is gone, but the cap and body collapse into detached flattened patches rather
+than a bottle, so the review status is
+`severe-fragmented-incomplete-reconstruction`. Protocol scope, GT tier,
+scene/instance unit type, and prediction-generation track are never merged into
+one score. See
 `reports/GT_CALIBRATION_V1_REPORT_zh.md` and
 `reports/GT_REPRESENTATIVE_GENRECON_V1_REPORT_zh.md` for source checksums,
 metrics, limitations, and reproduction commands.
@@ -260,8 +269,12 @@ metrics, limitations, and reproduction commands.
 Representative same-camera review videos are available locally at
 `outputs/gt-calibration-v1/visualizations-v1/index.html`. Each prepared scene
 shows frozen reference RGB beside evaluation-only GT/reference geometry. The
-third panel contains the registry-backed GenRecon prediction. Build and
-release-validate the review set with:
+third panel contains the registry-backed GenRecon prediction. A compact offline
+bundle with the page and all 29 videos is available at
+`outputs/gt-calibration-v1/genrecon-gt-calibration-offline-preview-v1.zip`
+(58,176,454 bytes; SHA256
+`36ed25540bb5fd2f1643359cc266a851d57947fc59fbb465ebec19de32ecb244`).
+Build and release-validate the review set with:
 
 ```sh
 EGL_PLATFORM=surfaceless .venv/bin/python \
@@ -269,9 +282,11 @@ EGL_PLATFORM=surfaceless .venv/bin/python \
 .venv/bin/python tools/validate_gt_calibration_videos.py
 ```
 
-The current review has seven prepared source/reference representatives, six
-registry-backed GenRecon prediction renders, one explicit OmniObject3D
-`missing-prediction` panel, and no source blocker. See
+The current review has seven prepared source/reference representatives, seven
+registry-backed GenRecon prediction renders, and no source blocker. The
+OmniObject3D prediction is intentionally retained despite failing geometry and
+visual review, and the HTML marks it
+`severe-fragmented-incomplete-reconstruction`. See
 `reports/GT_CALIBRATION_VIDEO_VISUALIZATION_V1_REPORT_zh.md` for the per-dataset
 selection, provenance boundaries, hashes, and validation counts.
 

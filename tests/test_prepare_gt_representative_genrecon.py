@@ -10,6 +10,7 @@ import numpy as np
 from PIL import Image
 
 from tools.prepare_gt_representative_genrecon import (
+    _white_background_foreground_mask,
     assign_visible_observations,
     camera_to_world_from_record,
     conditioning_manifest_contract_sha256,
@@ -25,12 +26,27 @@ from tools.prepare_gt_representative_genrecon import (
     umeyama_similarity,
     validate_all,
     validate_genrecon_input_assets,
+    validate_prediction_package,
     validate_source_audit,
     wrap_glb_with_transform,
 )
 
 
 class GroundTruthRepresentativeGenReconTests(unittest.TestCase):
+    def test_rgb_foreground_mask_removes_only_border_connected_exact_white(self) -> None:
+        rgb = np.full((9, 9, 3), 255, dtype=np.uint8)
+        rgb[2:7, 2:7] = [20, 80, 40]
+        rgb[4, 4] = 255
+        rgb[0, 4] = [254, 254, 254]
+
+        foreground = _white_background_foreground_mask(rgb)
+
+        self.assertFalse(foreground[0, 0])
+        self.assertTrue(foreground[2, 2])
+        self.assertTrue(foreground[4, 4])
+        self.assertTrue(foreground[0, 4])
+        self.assertAlmostEqual(float(foreground.mean()), 26 / 81)
+
     def test_camera_schema_normalizes_world_to_camera_and_dict_intrinsics(self) -> None:
         world_to_camera = np.eye(4)
         world_to_camera[:3, 3] = [1.0, -2.0, 3.0]
@@ -114,6 +130,35 @@ class GroundTruthRepresentativeGenReconTests(unittest.TestCase):
         self.assertAlmostEqual(result["scale"], 3.0)
         self.assertLess(result["center_error_normalized_by_baseline"]["max"], 1e-10)
         self.assertLess(result["rotation_error_deg"]["max"], 1e-8)
+
+    def test_trajectory_alignment_uses_normalized_object_labels_without_meter_keys(self) -> None:
+        c2w = np.repeat(np.eye(4)[None], 4, axis=0)
+        c2w[:, :3, 3] = [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+        extrinsic = np.repeat(np.eye(4)[None, :3], 4, axis=0)
+        extrinsic[:, :3, 3] = -c2w[:, :3, 3]
+        result = trajectory_alignment(
+            extrinsic, c2w, coordinate_units="normalized-object"
+        )
+
+        def keys(value: object) -> list[str]:
+            if isinstance(value, dict):
+                return [
+                    *value.keys(),
+                    *(item for child in value.values() for item in keys(child)),
+                ]
+            if isinstance(value, list):
+                return [item for child in value for item in keys(child)]
+            return []
+
+        self.assertEqual(result["coordinate_units"], "normalized-object")
+        self.assertIn("target_baseline_diagonal", result)
+        self.assertIn("center_error", result)
+        self.assertFalse(any(name.endswith("_m") for name in keys(result)))
 
     def test_conditioning_contract_does_not_resolve_forbidden_assets(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -500,7 +545,7 @@ class GroundTruthRepresentativeGenReconTests(unittest.TestCase):
                 "genrecon.gt-representative-inference-validation",
             )
 
-    def test_package_reuse_requires_current_input_contract(self) -> None:
+    def test_normalized_package_reuse_and_tamper_guards(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             input_root = root / "inputs"
@@ -509,13 +554,60 @@ class GroundTruthRepresentativeGenReconTests(unittest.TestCase):
             reconstruction = prediction_root / "candidates" / "unit-a" / "reconstruction"
             input_scene.mkdir(parents=True)
             reconstruction.mkdir(parents=True)
+            (input_scene / "genrecon_preflight").mkdir()
             matrix = np.eye(4)
+            camera_selection = {
+                "policy": "frustum-and-minimum-projected-chunk-area",
+                "minimum_projected_chunk_area": 0.2,
+                "required_fallback_count": 0,
+                "rationale": "small-object-frustum-visibility",
+            }
             input_manifest = {
                 "unit_id": "unit-a",
+                "coordinate_units": "normalized-object",
+                "genrecon_camera_selection": camera_selection,
                 "work_frame": {"work_to_official": matrix.tolist()},
                 "limitations": [],
             }
             (input_scene / "manifest.json").write_text(json.dumps(input_manifest))
+            camera_document = {
+                "scene": [],
+                "chunks": [
+                    {
+                        "chunk_index": 0,
+                        "cond2d_view": {
+                            "selection_mode": "visible-projected-area",
+                            "projected_chunk_area": 0.25,
+                            "minimum_projected_chunk_area": 0.2,
+                        },
+                    }
+                ],
+            }
+            preflight = {
+                "status": "passed",
+                "chunk_count": 1,
+                "closest_camera_fallback_count": 0,
+                "camera_selection": {
+                    "policy": "frustum-and-minimum-projected-chunk-area",
+                    "minimum_projected_chunk_area": 0.2,
+                    "required_fallback_count": 0,
+                    "selected_projected_chunk_area_min": 0.25,
+                    "selected_projected_chunk_area_max": 0.25,
+                    "selected_chunks_meeting_area_gate": 1,
+                },
+            }
+            (input_scene / "genrecon_preflight" / "preflight.json").write_text(
+                json.dumps(preflight)
+            )
+            (input_scene / "genrecon_preflight" / "cameras.json").write_text(
+                json.dumps(camera_document)
+            )
+            (reconstruction / "args.json").write_text(
+                json.dumps({"min_projected_chunk_area": 0.2})
+            )
+            (reconstruction / "cameras.json").write_text(
+                json.dumps(camera_document)
+            )
 
             header = (
                 "ply\nformat binary_little_endian 1.0\n"
@@ -549,6 +641,9 @@ class GroundTruthRepresentativeGenReconTests(unittest.TestCase):
                 "unit-a", input_root, prediction_root, force=False
             )
 
+            self.assertEqual(
+                first["coordinate_units"], "normalized-object"
+            )
             self.assertNotEqual(
                 first["source"]["input_manifest_contract_sha256"],
                 second["source"]["input_manifest_contract_sha256"],
@@ -558,6 +653,88 @@ class GroundTruthRepresentativeGenReconTests(unittest.TestCase):
                 second["outputs"]["mesh"]["sha256"],
             )
             self.assertEqual(second["alignment"]["work_to_official"][0][3], 5.0)
+
+            package = (
+                prediction_root
+                / "candidates"
+                / "unit-a"
+                / "prediction_official"
+            )
+            package_manifest = package / "manifest.json"
+            preflight_cameras = (
+                input_scene / "genrecon_preflight" / "cameras.json"
+            )
+            reconstruction_args = reconstruction / "args.json"
+            reconstruction_cameras = reconstruction / "cameras.json"
+            self.assertEqual(
+                validate_prediction_package(package, "unit-a"),
+                package / "mesh.ply",
+            )
+
+            def assert_rejected(path, mutate, message) -> None:
+                original = json.loads(path.read_text())
+                changed = json.loads(path.read_text())
+                mutate(changed)
+                path.write_text(json.dumps(changed))
+                try:
+                    with self.assertRaisesRegex(RuntimeError, message):
+                        validate_prediction_package(package, "unit-a")
+                finally:
+                    path.write_text(json.dumps(original))
+                self.assertEqual(
+                    validate_prediction_package(package, "unit-a"),
+                    package / "mesh.ply",
+                )
+
+            assert_rejected(
+                input_scene / "manifest.json",
+                lambda value: value["genrecon_camera_selection"].__setitem__(
+                    "minimum_projected_chunk_area", 0.3
+                ),
+                "input manifest changed",
+            )
+            assert_rejected(
+                preflight_cameras,
+                lambda value: value["chunks"][0]["cond2d_view"].__setitem__(
+                    "selection_mode", "closest-camera-fallback"
+                ),
+                "Preflight chunk did not pass projected-area camera selection",
+            )
+            assert_rejected(
+                reconstruction_args,
+                lambda value: value.__setitem__("min_projected_chunk_area", 0.3),
+                "source args changed",
+            )
+            assert_rejected(
+                reconstruction_cameras,
+                lambda value: value["chunks"][0]["cond2d_view"].__setitem__(
+                    "selection_mode", "closest-camera-fallback"
+                ),
+                "source cameras changed",
+            )
+            assert_rejected(
+                package_manifest,
+                lambda value: value["source"]["camera_selection"].__setitem__(
+                    "minimum_projected_chunk_area", 0.3
+                ),
+                "camera-selection contract mismatch",
+            )
+            for source_name in ("args", "cameras"):
+                assert_rejected(
+                    package_manifest,
+                    lambda value, key=source_name: value["source"]["sha256"].__setitem__(
+                        key, "0" * 64
+                    ),
+                    f"source {source_name} changed",
+                )
+
+    def test_representative_plan_includes_omni_video_unit(self) -> None:
+        plan = json.loads(
+            (Path(__file__).parents[1] / "configs/eval/gt_representative_inference_v1.json")
+            .read_text(encoding="utf-8")
+        )
+        self.assertIn("omniobject3d-bottle_045", plan["unit_ids"])
+        self.assertIn("coordinate-unit-preserving", plan["protocol"]["work_frame"])
 
     def test_binary_ply_and_glb_apply_same_matrix(self) -> None:
         matrix = np.eye(4)

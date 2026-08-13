@@ -10,6 +10,7 @@ from tools.prepare_foundation_sfm import (
     build_model_inputs,
     evenly_select_with_dynamic,
     foundation_quality_gate,
+    genrecon_preflight_camera_selection_is_current,
     model_intrinsics_to_original,
     model_xy_to_original,
     padded_shape,
@@ -20,6 +21,75 @@ from tools.prepare_foundation_sfm import (
 
 
 class FoundationSfmTests(unittest.TestCase):
+    def test_preflight_reuse_requires_current_camera_selection_contract(self) -> None:
+        preflight = {
+            "status": "passed",
+            "chunk_count": 1,
+            "closest_camera_fallback_count": 0,
+            "camera_selection": {
+                "policy": "frustum-and-minimum-projected-chunk-area",
+                "minimum_projected_chunk_area": 0.2,
+                "required_fallback_count": 0,
+                "selected_projected_chunk_area_min": 0.25,
+                "selected_projected_chunk_area_max": 0.25,
+                "selected_chunks_meeting_area_gate": 1,
+            },
+        }
+        cameras = {
+            "chunks": [
+                {
+                    "chunk_index": 0,
+                    "cond2d_view": {
+                        "selection_mode": "visible-projected-area",
+                        "projected_chunk_area": 0.25,
+                        "minimum_projected_chunk_area": 0.2,
+                    },
+                }
+            ]
+        }
+
+        self.assertTrue(
+            genrecon_preflight_camera_selection_is_current(
+                preflight, cameras, 0.2
+            )
+        )
+        self.assertFalse(
+            genrecon_preflight_camera_selection_is_current(
+                preflight, cameras, 0.3
+            )
+        )
+        cameras["chunks"][0]["cond2d_view"].update(
+            {
+                "selection_mode": "closest-camera-fallback",
+                "projected_chunk_area": 0.15,
+            }
+        )
+        self.assertFalse(
+            genrecon_preflight_camera_selection_is_current(
+                preflight, cameras, 0.2
+            )
+        )
+        preflight["status"] = "marginal"
+        preflight["closest_camera_fallback_count"] = 1
+        preflight["camera_selection"].update(
+            {
+                "selected_projected_chunk_area_min": 0.15,
+                "selected_projected_chunk_area_max": 0.15,
+                "selected_chunks_meeting_area_gate": 0,
+            }
+        )
+        self.assertTrue(
+            genrecon_preflight_camera_selection_is_current(
+                preflight, cameras, 0.2
+            )
+        )
+        cameras["chunks"][0]["cond2d_view"]["projected_chunk_area"] = 0.25
+        self.assertFalse(
+            genrecon_preflight_camera_selection_is_current(
+                preflight, cameras, 0.2
+            )
+        )
+
     def test_pad_mapping_and_intrinsics_round_trip_for_landscape(self) -> None:
         record = padded_shape(1600, 900)
         self.assertEqual(

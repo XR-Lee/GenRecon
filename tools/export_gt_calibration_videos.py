@@ -1025,6 +1025,8 @@ def _build_available_candidate(
         },
         "status": AVAILABLE_STATUS,
         "prediction_status": prediction_status,
+        "review_status": entry.get("review_status", "not-reviewed"),
+        "review_note": entry.get("review_note"),
         "protocol": {
             "camera_policy": "exact frozen 8 conditioning + 8 heldout cameras; no interpolation",
             "frame_order": "conditioning 0-7 followed by heldout 0-7",
@@ -1168,7 +1170,10 @@ def _write_index_html(output: Path, rows: list[dict[str, Any]], overview: Path) 
                 f'<a href="{html.escape(str(Path(item["path"]).resolve().relative_to(output.resolve())))}">{kind}</a>'
                 for kind, item in row["videos"].items()
             )
-            detail = f"{row['inputs']['gt_tier']} | prediction: {row['prediction_status']}"
+            detail = (
+                f"{row['inputs']['gt_tier']} | prediction: {row['prediction_status']} | "
+                f"review: {row.get('review_status', 'not-reviewed')}"
+            )
         else:
             video = Path(row["videos"]["status"]["path"]).resolve().relative_to(output.resolve())
             links = '<span class="muted">No authorized source/reference/prediction assets</span>'
@@ -1193,7 +1198,11 @@ def _write_index_html(output: Path, rows: list[dict[str, Any]], overview: Path) 
 
 
 def _candidate_reusable(
-    manifest_path: Path, *, plan_path: Path, registry_path: Path
+    manifest_path: Path,
+    *,
+    plan_path: Path,
+    registry_path: Path,
+    source_manifest_path: Path | None = None,
 ) -> bool:
     if not manifest_path.is_file():
         return False
@@ -1208,6 +1217,16 @@ def _candidate_reusable(
     }
     if document.get("build_contract") != expected:
         return False
+    if document.get("status") == AVAILABLE_STATUS:
+        if source_manifest_path is None or not source_manifest_path.is_file():
+            return False
+        inputs = document.get("inputs", {})
+        recorded_manifest = resolve_path(inputs.get("manifest", ""), ROOT)
+        if (
+            recorded_manifest != source_manifest_path.resolve()
+            or inputs.get("manifest_sha256") != sha256_file(source_manifest_path)
+        ):
+            return False
     for video in document.get("videos", {}).values():
         path = Path(video.get("path", ""))
         if (
@@ -1240,8 +1259,14 @@ def build_all(args: argparse.Namespace) -> dict[str, Any]:
         registry_row = registry_units[entry["unit_id"]]
         candidate_dir = args.output / "candidates" / entry["unit_id"]
         manifest_path = candidate_dir / "manifest.json"
+        source_manifest_path = resolve_path(
+            registry_row["manifest"], args.registry.parent
+        )
         if not args.force and _candidate_reusable(
-            manifest_path, plan_path=args.plan, registry_path=args.registry
+            manifest_path,
+            plan_path=args.plan,
+            registry_path=args.registry,
+            source_manifest_path=source_manifest_path,
         ):
             row = load_json(manifest_path)
             print(f"[gt-visualization] reuse {entry['unit_id']}")
@@ -1287,6 +1312,7 @@ def build_all(args: argparse.Namespace) -> dict[str, Any]:
                 "scene_label": row["scene_label"],
                 "status": row["status"],
                 "prediction_status": row["prediction_status"],
+                "review_status": row.get("review_status", "not-reviewed"),
                 "manifest": root_relative(args.output / "candidates" / row["unit_id"] / "manifest.json"),
             }
             for row in rows

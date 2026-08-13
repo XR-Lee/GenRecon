@@ -8,6 +8,7 @@ from tools.run_foundation_genrecon_batch import (
     glb_command,
     parse_glb,
     parse_mesh_ply,
+    profile_is_complete,
     reconstruct_command,
     selected_candidates,
     validate_outputs,
@@ -24,6 +25,45 @@ class FoundationGenreconBatchTests(unittest.TestCase):
         self.assertNotIn("--center_crop", command)
         self.assertNotIn("--manual_z_bounds", command)
         self.assertNotIn("--min_track_len", command)
+        self.assertNotIn("--min_projected_chunk_area", command)
+
+    def test_object_scale_protocol_records_projected_area_gate(self) -> None:
+        command = reconstruct_command(
+            Path("/input"),
+            Path("/output"),
+            min_projected_chunk_area=0.2,
+        )
+        self.assertEqual(
+            command[command.index("--min_projected_chunk_area") + 1], "0.2"
+        )
+
+    def test_profile_reuse_rejects_stale_reconstruction_command(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            artifact = root / "mesh.ply"
+            artifact.write_bytes(b"mesh")
+            profile = root / "profile.json"
+            profile.write_text(
+                json.dumps(
+                    {
+                        "success": True,
+                        "return_code": 0,
+                        "command": ["old"],
+                        "artifacts": [
+                            {
+                                "path": str(artifact),
+                                "size_bytes": artifact.stat().st_size,
+                            }
+                        ],
+                    }
+                )
+            )
+            self.assertTrue(
+                profile_is_complete(profile, [artifact], expected_command=["old"])
+            )
+            self.assertFalse(
+                profile_is_complete(profile, [artifact], expected_command=["new"])
+            )
 
     def test_native_sfm_protocol_uses_explicit_track_filters(self) -> None:
         command = reconstruct_command(

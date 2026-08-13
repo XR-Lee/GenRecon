@@ -2586,6 +2586,13 @@ def _validate_representative_input_sources(
         source_document = load_json(source_manifest)
         if source_document.get("unit_id") != unit_id or source_document.get("status") != "prepared":
             raise CalibrationBuildError("source unit manifest is not the prepared unit")
+        source_coordinate_units = source_document.get("reference", {}).get(
+            "coordinate_units", "meters"
+        )
+        if document.get("coordinate_units", "meters") != source_coordinate_units:
+            raise CalibrationBuildError(
+                "representative input coordinate units differ from source unit"
+            )
         conditioning_contract = _conditioning_manifest_contract_sha256(source_document)
         if (
             document.get("source_manifest_conditioning_contract_sha256")
@@ -2659,6 +2666,72 @@ def _representative_input_contract_sha256(document: dict[str, Any]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _validate_normalized_prediction_camera_selection(
+    package_source: dict[str, Any],
+    reconstruction: Path | None,
+    input_manifest: Path,
+    input_document: dict[str, Any],
+) -> None:
+    if input_document.get("coordinate_units", "meters") != "normalized-object":
+        return
+    error = "normalized-object prediction camera-selection contract is invalid"
+    try:
+        if not isinstance(package_source, dict) or not isinstance(reconstruction, Path):
+            raise TypeError("prediction source paths are missing")
+        contract = input_document.get("genrecon_camera_selection", {})
+        if not isinstance(contract, dict):
+            raise TypeError("camera-selection contract is not an object")
+        expected_area = float(contract.get("minimum_projected_chunk_area", -1.0))
+        preflight_root = input_manifest.parent / "genrecon_preflight"
+        preflight = load_json(preflight_root / "preflight.json")
+        preflight_cameras = load_json(preflight_root / "cameras.json")
+        reconstruction_args = load_json(reconstruction / "args.json")
+        reconstruction_cameras = load_json(reconstruction / "cameras.json")
+        chunk_records = preflight_cameras.get("chunks", [])
+        area_summary = preflight.get("camera_selection", {})
+        source_hashes = package_source.get("sha256", {})
+        if not isinstance(source_hashes, dict):
+            raise TypeError("prediction source hashes are not an object")
+        areas = [
+            float(item.get("cond2d_view", {}).get("projected_chunk_area", -1.0))
+            for item in chunk_records
+        ]
+        valid = (
+            contract.get("policy") == "frustum-and-minimum-projected-chunk-area"
+            and contract.get("required_fallback_count") == 0
+            and 0.0 <= expected_area <= 1.0
+            and preflight.get("status") == "passed"
+            and preflight.get("closest_camera_fallback_count") == 0
+            and area_summary.get("policy")
+            == "frustum-and-minimum-projected-chunk-area"
+            and area_summary.get("minimum_projected_chunk_area") == expected_area
+            and area_summary.get("required_fallback_count") == 0
+            and len(chunk_records) == preflight.get("chunk_count")
+            and len(chunk_records) > 0
+            and all(
+                item.get("cond2d_view", {}).get("selection_mode")
+                == "visible-projected-area"
+                and item.get("cond2d_view", {}).get("minimum_projected_chunk_area")
+                == expected_area
+                and area >= expected_area
+                for item, area in zip(chunk_records, areas)
+            )
+            and area_summary.get("selected_projected_chunk_area_min") == min(areas)
+            and area_summary.get("selected_projected_chunk_area_max") == max(areas)
+            and area_summary.get("selected_chunks_meeting_area_gate") == len(areas)
+            and reconstruction_args.get("min_projected_chunk_area") == expected_area
+            and reconstruction_cameras == preflight_cameras
+            and package_source.get("camera_selection") == contract
+            and source_hashes.get("args") == sha256_file(reconstruction / "args.json")
+            and source_hashes.get("cameras")
+            == sha256_file(reconstruction / "cameras.json")
+        )
+    except (CalibrationBuildError, KeyError, OSError, TypeError, ValueError) as exc:
+        raise CalibrationBuildError(error) from exc
+    if not valid:
+        raise CalibrationBuildError(error)
+
+
 def validate_prediction_override(
     plan: dict[str, Any], unit_id: str
 ) -> dict[str, Any] | None:
@@ -2715,6 +2788,9 @@ def validate_prediction_override(
     input_contract = source.get("input_manifest_contract_sha256")
     if input_document is not None:
         _validate_representative_input_sources(input_document, input_manifest, unit_id)
+        _validate_normalized_prediction_camera_selection(
+            source, reconstruction, input_manifest, input_document
+        )
     if (
         package.get("schema") != "genrecon.gt-representative-prediction-package"
         or package.get("schema_version") != 1
@@ -2722,6 +2798,9 @@ def validate_prediction_override(
         or package.get("unit_id") != unit_id
         or package.get("track") != expected_track
         or package.get("coordinate_frame") != "declared calibration/reference frame"
+        or input_document is None
+        or package.get("coordinate_units", "meters")
+        != input_document.get("coordinate_units", "meters")
         or matrix.shape != (4, 4)
         or not np.isfinite(matrix).all()
         or not np.allclose(matrix[3], [0.0, 0.0, 0.0, 1.0], atol=1e-8)

@@ -13,8 +13,8 @@ calibration plan in `configs/eval/gt_calibration_v1.json`.
 | 7-Scenes | G1 | 7 | 7 | 1 | `chess` representative evaluated; six await reconstruction |
 | Redwood synthetic | G2 | 2 | 2 | 1 | `livingroom` representative evaluated; one awaits reconstruction |
 | DTU | O0 | 15 | 15 | 1 | `scan24` representative evaluated; 14 await reconstruction |
-| OmniObject3D official objects | O0 | 24 | 24 | 0 | Complete RGB/cameras/normalized scan packages; all await reconstruction |
-| **Total** | | **76** | **76** | **26** | **50 prepared units await prediction; no source blocker** |
+| OmniObject3D official objects | O0 | 24 | 24 | 1 | `bottle_045` evaluated; 23 await reconstruction |
+| **Total** | | **76** | **76** | **27** | **49 prepared units await prediction; no source blocker** |
 
 `prepared` means the requested input split, camera metadata, reference geometry,
 source provenance and strict manifest are available. It does not mean that a
@@ -30,8 +30,8 @@ audit and are not exported as conditioning.
 
 - `validation.json`: `pass`; 76 manifests, 82 reference files, 351,284,071
   reference vertices, 101,807,332 faces, 1,214 decoded RGB views, 464 decoded
-  depth maps, 26 prediction files totaling 12,059,314,964 bytes, 24 deep Omni
-  package contracts, and 197 strict JSON files.
+  depth maps, 27 prediction files totaling 12,065,298,771 bytes, 24 deep Omni
+  package contracts, and 202 strict JSON files.
 - `source_validation.json`: `pass`; 71 source archives/videos and 80,772,051,894
   bytes checked. This includes 22 ZIP CRC checks, 10 7z CRC checks, one video
   sample decode, and 38 TAR/GZip stream/path-safety checks bound to the OpenXLab
@@ -59,7 +59,7 @@ PYTHONPATH=/tmp/pycolmap-wheel .venv/bin/python \
   --output-root reports/generated/gt-calibration-v1/evaluations
 ```
 
-The four new representative predictions are built and registered separately:
+The five new representative predictions are built and registered separately:
 
 ```bash
 .venv/bin/python tools/prepare_gt_representative_genrecon.py prepare
@@ -79,7 +79,9 @@ area-weighted prediction samples, up to 1,000,000 reference points, absolute
 2/5/10 cm F-scores, bbox-normalized 0.5%/1%/2% scores, and strict JSON. GT
 provenance tiers, protocol signatures, scene/instance tracks, and prediction
 generation tracks remain separate. T&T uses the distinct
-`official-crop-global-reference` scope; the other 25 results use `raw-global`.
+`official-crop-global-reference` scope; 25 meter-coordinate results use
+`raw-global`; OmniObject3D `bottle_045` uses a third
+`normalized-object-global-reference` protocol with no absolute thresholds.
 Point-cloud GT has no fabricated normal score; the field is `null`.
 
 ## Boundaries
@@ -96,7 +98,7 @@ Point-cloud GT has no fabricated normal score; the field is `null`.
   371 official frames contribute to fixed-pose intrinsics calibration and the
   official global trajectory. They are not intrinsics- or geometry-independent
   heldout evidence.
-- The four representative additions use VGGT-1B pseudo geometry and official
+- The five representative additions use VGGT-1B pseudo geometry and official
   conditioning cameras for Sim(3) alignment. They belong to the
   `GT-pose-foundation-pseudo-geometry` prediction track, not an estimated-pose
   end-to-end track. VGGT-1B is CC-BY-NC-4.0.
@@ -107,4 +109,12 @@ Point-cloud GT has no fabricated normal score; the field is `null`.
   thresholds only; its units must not be reported in meters or merged with DTU
   despite sharing the `O0` provenance tier. The 100-view RGB and scans come from
   the same object, so heldout RGB is not geometry-independent evidence.
+- OmniObject3D `bottle_045` has a registry-backed prediction but remains a
+  severe failure. Conditioning-RGB-derived exact-white background masking
+  removes the earlier invalid full-frame plane result. The final prediction/GT
+  bbox diagonals are 1.646/2.184 normalized units, normalized Chamfer is
+  0.199096, and bbox-diagonal F-scores at 0.5%, 1%, and 2% are 0.012049,
+  0.025558, and 0.058624. Same-camera review shows the cap and body collapsed
+  into detached flattened patches rather than a bottle; technical validation
+  does not override this `severe-fragmented-incomplete-reconstruction` finding.
 - Dataset licenses and terms remain attached to every source and derivative.

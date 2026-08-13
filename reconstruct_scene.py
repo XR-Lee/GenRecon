@@ -554,6 +554,14 @@ def build_parser() -> argparse.ArgumentParser:
         "(additive chunk_size); passing it explicitly there is an error.",
     )
     parser.add_argument(
+        "--min_projected_chunk_area",
+        type=float,
+        default=0.4,
+        help="Minimum normalized image area covered by a projected chunk cube when "
+        "selecting cameras (default 0.4). Object-scale tracks may lower this "
+        "explicitly; the frustum test and zero-fallback requirement remain active.",
+    )
+    parser.add_argument(
         "--colmap_subdir",
         default="colmap",
         help="Subdirectory under --path holding cameras.txt/images.txt/points3D.txt "
@@ -1020,6 +1028,9 @@ def main() -> None:
     selecter_kwargs: dict = {}
     if args.mode in ("Scannet_iphone", "Iphone"):
         selecter_kwargs["center_crop"] = args.center_crop
+        selecter_kwargs["min_projected_chunk_area"] = args.min_projected_chunk_area
+    elif args.min_projected_chunk_area != 0.4:
+        parser.error("--min_projected_chunk_area is only supported for iPhone modes.")
     sel = selecter_cls(**selecter_kwargs).get_images(
         m_o2c,
         transforms_json(scene_path),

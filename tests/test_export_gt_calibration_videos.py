@@ -52,8 +52,10 @@ def test_candidate_reuse_requires_current_contract_and_video_hash(tmp_path: Path
     registry = tmp_path / "registry.json"
     video = tmp_path / "video.mp4"
     manifest = tmp_path / "manifest.json"
+    source_manifest = tmp_path / "unit-manifest.json"
     plan.write_text("{}\n")
     registry.write_text("{}\n")
+    source_manifest.write_text("{\"version\": 1}\n")
     video.write_bytes(b"video")
     import hashlib
 
@@ -67,6 +69,13 @@ def test_candidate_reuse_requires_current_contract_and_video_hash(tmp_path: Path
         json.dumps(
             {
                 "build_contract": contract,
+                "status": "available",
+                "inputs": {
+                    "manifest": str(source_manifest),
+                    "manifest_sha256": hashlib.sha256(
+                        source_manifest.read_bytes()
+                    ).hexdigest(),
+                },
                 "videos": {
                     "comparison": {
                         "path": str(video),
@@ -78,9 +87,27 @@ def test_candidate_reuse_requires_current_contract_and_video_hash(tmp_path: Path
         )
     )
 
-    assert _candidate_reusable(manifest, plan_path=plan, registry_path=registry)
+    assert _candidate_reusable(
+        manifest,
+        plan_path=plan,
+        registry_path=registry,
+        source_manifest_path=source_manifest,
+    )
+    source_manifest.write_text("{\"version\": 2}\n")
+    assert not _candidate_reusable(
+        manifest,
+        plan_path=plan,
+        registry_path=registry,
+        source_manifest_path=source_manifest,
+    )
+    source_manifest.write_text("{\"version\": 1}\n")
     video.write_bytes(b"changed")
-    assert not _candidate_reusable(manifest, plan_path=plan, registry_path=registry)
+    assert not _candidate_reusable(
+        manifest,
+        plan_path=plan,
+        registry_path=registry,
+        source_manifest_path=source_manifest,
+    )
 
 
 def test_visualization_plan_covers_each_registry_dataset_once() -> None:

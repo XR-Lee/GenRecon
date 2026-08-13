@@ -565,6 +565,7 @@ intrinsic
                             str(path.relative_to(unit_dir)) for path in rgb_paths
                         ],
                     },
+                    "reference": {"coordinate_units": "normalized-object"},
                 }
                 write_json(unit_manifest, unit_document)
                 conditioning_contract = gt_builder._conditioning_manifest_contract_sha256(
@@ -612,11 +613,18 @@ intrinsic
                             "sha256": sha256_file(path),
                         }
                     )
+                camera_selection = {
+                    "policy": "frustum-and-minimum-projected-chunk-area",
+                    "minimum_projected_chunk_area": 0.2,
+                    "required_fallback_count": 0,
+                    "rationale": "small-object-frustum-visibility",
+                }
                 input_document = {
                     "schema": "genrecon.gt-representative-foundation-input",
                     "schema_version": 1,
                     "unit_id": "unit-a",
                     "track": "GT-pose-foundation-pseudo-geometry",
+                    "coordinate_units": "normalized-object",
                     "source_manifest": str(unit_manifest.relative_to(root)),
                     "source_manifest_conditioning_contract_sha256": conditioning_contract,
                     "source_audit": {
@@ -627,10 +635,47 @@ intrinsic
                         "conditioning_camera_records_used": 8,
                         "heldout_camera_records_used": 0,
                     },
+                    "genrecon_camera_selection": camera_selection,
                     "genrecon_input_assets": asset_records,
                     "inference": {"input_views": 8, "elapsed_seconds": 1.0},
                     "work_frame": {"work_to_official": np.eye(4).tolist()},
                 }
+                camera_document = {
+                    "scene": [],
+                    "chunks": [
+                        {
+                            "chunk_index": 0,
+                            "cond2d_view": {
+                                "selection_mode": "visible-projected-area",
+                                "projected_chunk_area": 0.25,
+                                "minimum_projected_chunk_area": 0.2,
+                            },
+                        }
+                    ],
+                }
+                preflight = {
+                    "status": "passed",
+                    "chunk_count": 1,
+                    "closest_camera_fallback_count": 0,
+                    "camera_selection": {
+                        "policy": "frustum-and-minimum-projected-chunk-area",
+                        "minimum_projected_chunk_area": 0.2,
+                        "required_fallback_count": 0,
+                        "selected_projected_chunk_area_min": 0.25,
+                        "selected_projected_chunk_area_max": 0.25,
+                        "selected_chunks_meeting_area_gate": 1,
+                    },
+                }
+                preflight_root = input_manifest.parent / "genrecon_preflight"
+                write_json(preflight_root / "preflight.json", preflight)
+                write_json(preflight_root / "cameras.json", camera_document)
+                reconstruction_args = reconstruction / "args.json"
+                reconstruction_cameras = reconstruction / "cameras.json"
+                write_json(
+                    reconstruction_args,
+                    {"min_projected_chunk_area": 0.2},
+                )
+                write_json(reconstruction_cameras, camera_document)
                 write_json(input_manifest, input_document)
                 input_contract = gt_builder._representative_input_contract_sha256(
                     input_document
@@ -644,6 +689,7 @@ intrinsic
                         "unit_id": "unit-a",
                         "track": "GT-pose-foundation-pseudo-geometry",
                         "coordinate_frame": "declared calibration/reference frame",
+                        "coordinate_units": "normalized-object",
                         "alignment": {
                             "method": "conditioning-camera-only Sim(3), followed by exact work-to-official inverse",
                             "work_to_official": np.eye(4).tolist(),
@@ -656,7 +702,10 @@ intrinsic
                             "sha256": {
                                 "mesh": sha256_file(source_mesh),
                                 "glb": sha256_file(source_glb),
+                                "args": sha256_file(reconstruction_args),
+                                "cameras": sha256_file(reconstruction_cameras),
                             },
+                            "camera_selection": camera_selection,
                             "input_manifest": str(input_manifest.relative_to(root)),
                             "input_manifest_contract_sha256": input_contract,
                         },
@@ -678,6 +727,77 @@ intrinsic
                 self.assertEqual(result["mesh"], mesh)
                 self.assertEqual(result["glb"], glb)
                 self.assertEqual(result["track"], "GT-pose-foundation-pseudo-geometry")
+
+                def assert_normalized_rejected(path, mutate) -> None:
+                    original = json.loads(path.read_text())
+                    changed = json.loads(path.read_text())
+                    mutate(changed)
+                    write_json(path, changed)
+                    gt_builder._HASH_CACHE.clear()
+                    try:
+                        with self.assertRaisesRegex(
+                            CalibrationBuildError,
+                            "normalized-object prediction camera-selection contract",
+                        ):
+                            validate_prediction_override(plan, "unit-a")
+                    finally:
+                        write_json(path, original)
+                        gt_builder._HASH_CACHE.clear()
+                    self.assertEqual(
+                        validate_prediction_override(plan, "unit-a")["mesh"], mesh
+                    )
+
+                assert_normalized_rejected(
+                    input_manifest,
+                    lambda value: value["genrecon_camera_selection"].__setitem__(
+                        "minimum_projected_chunk_area", 0.3
+                    ),
+                )
+                assert_normalized_rejected(
+                    preflight_root / "cameras.json",
+                    lambda value: value["chunks"][0]["cond2d_view"].__setitem__(
+                        "selection_mode", "closest-camera-fallback"
+                    ),
+                )
+                assert_normalized_rejected(
+                    reconstruction_args,
+                    lambda value: value.__setitem__(
+                        "min_projected_chunk_area", 0.3
+                    ),
+                )
+                assert_normalized_rejected(
+                    reconstruction_cameras,
+                    lambda value: value["chunks"][0]["cond2d_view"].__setitem__(
+                        "selection_mode", "closest-camera-fallback"
+                    ),
+                )
+                assert_normalized_rejected(
+                    package,
+                    lambda value: value["source"]["camera_selection"].__setitem__(
+                        "minimum_projected_chunk_area", 0.3
+                    ),
+                )
+                for source_name in ("args", "cameras"):
+                    assert_normalized_rejected(
+                        package,
+                        lambda value, key=source_name: value["source"]["sha256"].__setitem__(
+                            key, "0" * 64
+                        ),
+                    )
+                assert_normalized_rejected(
+                    package,
+                    lambda value: value["source"].__setitem__(
+                        "reconstruction", "outputs/unit-a/missing-reconstruction"
+                    ),
+                )
+
+                document = json.loads(package.read_text())
+                document["coordinate_units"] = "meters"
+                write_json(package, document)
+                with self.assertRaisesRegex(CalibrationBuildError, "Invalid prediction"):
+                    validate_prediction_override(plan, "unit-a")
+                document["coordinate_units"] = "normalized-object"
+                write_json(package, document)
                 glb.write_bytes(b"changed")
                 with self.assertRaisesRegex(CalibrationBuildError, "Invalid prediction"):
                     validate_prediction_override(plan, "unit-a")

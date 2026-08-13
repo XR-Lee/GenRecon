@@ -234,7 +234,8 @@ class RoomCameraConditionedMixin:
         return pack
 
 
-def chunk_visible_in_camera(T_w2c, K, min_area: float = 0.4):
+def projected_chunk_area_in_camera(T_w2c, K) -> float:
+    """Return the clipped normalized-image area of the projected chunk cube."""
     # 8 corners + center of normalized chunk cube.
     points = torch.tensor(
         [
@@ -258,14 +259,14 @@ def chunk_visible_in_camera(T_w2c, K, min_area: float = 0.4):
     z = cam[:, 2]
     front = z > 0
     if not torch.any(front):
-        return False
+        return 0.0
 
     cam = cam[front]
     uvw = (K @ cam.T).T  # normalized K
     z_proj = uvw[:, 2]
     finite = torch.isfinite(uvw).all(dim=-1) & (torch.abs(z_proj) > 1e-8)
     if not torch.any(finite):
-        return False
+        return 0.0
 
     uvw = uvw[finite]
     u = uvw[:, 0] / uvw[:, 2]
@@ -278,4 +279,8 @@ def chunk_visible_in_camera(T_w2c, K, min_area: float = 0.4):
     umin, umax = torch.min(u), torch.max(u)
     vmin, vmax = torch.min(v), torch.max(v)
     area = torch.clamp(umax - umin, min=0.0) * torch.clamp(vmax - vmin, min=0.0)
-    return bool(area >= float(min_area))
+    return float(area)
+
+
+def chunk_visible_in_camera(T_w2c, K, min_area: float = 0.4):
+    return projected_chunk_area_in_camera(T_w2c, K) >= float(min_area)

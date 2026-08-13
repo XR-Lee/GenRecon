@@ -3,8 +3,9 @@
 
 Only each unit's frozen conditioning RGB and conditioning camera metadata are
 used to build VGGT pseudo geometry. Heldout RGB/depth and evaluation reference
-geometry are explicitly excluded. GenRecon runs in a metric z-up work frame;
-packaging maps its PLY and PBR GLB back to the declared calibration frame.
+geometry are explicitly excluded. GenRecon runs in a coordinate-unit-preserving
+z-up work frame; packaging maps its PLY and PBR GLB back to the declared
+calibration frame.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ from typing import Any
 import numpy as np
 import torch
 from PIL import Image
+from scipy import ndimage
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -213,6 +215,11 @@ def load_conditioning_contract(unit_id: str, units_root: Path) -> dict[str, Any]
     manifest = load_json(manifest_path)
     if manifest.get("unit_id") != unit_id or manifest.get("status") != "prepared":
         raise RepresentativeInferenceError(f"Unit is not a prepared calibration package: {unit_id}")
+    coordinate_units = manifest.get("reference", {}).get("coordinate_units", "meters")
+    if coordinate_units not in {"meters", "normalized-object"}:
+        raise RepresentativeInferenceError(
+            f"Unsupported calibration coordinate units for {unit_id}: {coordinate_units!r}"
+        )
     camera_path = _resolve(manifest["input"]["cameras"], unit_dir)
     camera_document = load_json(camera_path)
     records = camera_document.get("conditioning")
@@ -265,6 +272,7 @@ def load_conditioning_contract(unit_id: str, units_root: Path) -> dict[str, Any]
         ),
         "camera_path": camera_path,
         "manifest": manifest,
+        "coordinate_units": coordinate_units,
         "views": views,
         "source_files_read": [manifest_path, camera_path, *declared],
         "declared_but_forbidden": {
@@ -327,7 +335,10 @@ def transform_world_similarity(
 
 
 def trajectory_alignment(
-    predicted_extrinsic: np.ndarray, official_c2w: np.ndarray
+    predicted_extrinsic: np.ndarray,
+    official_c2w: np.ndarray,
+    *,
+    coordinate_units: str = "meters",
 ) -> dict[str, Any]:
     predicted_rotations = np.transpose(predicted_extrinsic[:, :3, :3], (0, 2, 1))
     predicted_centers = -np.einsum(
@@ -341,15 +352,33 @@ def trajectory_alignment(
         cosine = np.clip((np.trace(residual) - 1.0) / 2.0, -1.0, 1.0)
         rotation_errors.append(float(np.degrees(np.arccos(cosine))))
     baseline = float(np.linalg.norm(np.ptp(target_centers, axis=0)))
-    return {
+    result = {
         **aligned,
-        "target_baseline_diagonal_m": baseline,
-        "center_error_m": percentile_summary(aligned["errors"]),
+        "coordinate_units": coordinate_units,
         "center_error_normalized_by_baseline": percentile_summary(
             aligned["errors"] / max(baseline, 1e-12)
         ),
         "rotation_error_deg": percentile_summary(rotation_errors),
     }
+    if coordinate_units == "meters":
+        result.update(
+            {
+                "target_baseline_diagonal_m": baseline,
+                "center_error_m": percentile_summary(aligned["errors"]),
+            }
+        )
+    elif coordinate_units == "normalized-object":
+        result.update(
+            {
+                "target_baseline_diagonal": baseline,
+                "center_error": percentile_summary(aligned["errors"]),
+            }
+        )
+    else:
+        raise RepresentativeInferenceError(
+            f"Unsupported trajectory coordinate units: {coordinate_units!r}"
+        )
+    return result
 
 
 def derive_official_to_work(
@@ -472,6 +501,27 @@ def representative_quality_gate(
     }
 
 
+def _white_background_foreground_mask(rgb: np.ndarray) -> np.ndarray:
+    """Infer object foreground from border-connected exact-white pixels."""
+    pixels = np.asarray(rgb, dtype=np.uint8)
+    if pixels.ndim != 3 or pixels.shape[2] != 3:
+        raise RepresentativeInferenceError("White-background mask requires RGB pixels")
+    white = np.all(pixels == 255, axis=2)
+    seeds = np.zeros_like(white)
+    seeds[0] = white[0]
+    seeds[-1] = white[-1]
+    seeds[:, 0] |= white[:, 0]
+    seeds[:, -1] |= white[:, -1]
+    background = ndimage.binary_propagation(seeds, mask=white)
+    foreground = ~background
+    fraction = float(np.mean(foreground))
+    if not (0.001 <= fraction <= 0.95):
+        raise RepresentativeInferenceError(
+            f"Implausible RGB-derived foreground fraction: {fraction:.6f}"
+        )
+    return foreground
+
+
 def _prepare_model_inputs(
     contract: dict[str, Any], scene_dir: Path, target: int = 518
 ) -> tuple[torch.Tensor, np.ndarray, np.ndarray, list[dict[str, Any]]]:
@@ -485,10 +535,17 @@ def _prepare_model_inputs(
         with Image.open(view["rgb"]) as opened:
             rgb = opened.convert("RGB")
         width, height = rgb.size
+        rgb_pixels = np.asarray(rgb)
+        if contract["coordinate_units"] == "normalized-object":
+            foreground_original = _white_background_foreground_mask(rgb_pixels)
+            mask_policy = "border-connected-exact-white-background-from-conditioning-rgb"
+        else:
+            foreground_original = np.ones((height, width), dtype=bool)
+            mask_policy = "full-image"
         shape = padded_shape(width, height, target=target)
         output_name = f"{view['order']:03d}.png"
         rgba = rgb.convert("RGBA")
-        rgba.putalpha(255)
+        rgba.putalpha(Image.fromarray(foreground_original.astype(np.uint8) * 255))
         rgba.save(output_rgb / output_name, compress_level=3)
         resized = np.asarray(
             rgb.resize(
@@ -497,12 +554,19 @@ def _prepare_model_inputs(
             ),
             dtype=np.uint8,
         )
+        resized_foreground = np.asarray(
+            Image.fromarray(foreground_original).resize(
+                (shape["resized_width"], shape["resized_height"]),
+                Image.Resampling.NEAREST,
+            ),
+            dtype=bool,
+        )
         canvas = np.full((target, target, 3), 255, dtype=np.uint8)
         valid = np.zeros((target, target), dtype=bool)
         left, top = shape["pad_left"], shape["pad_top"]
         right, bottom = left + shape["resized_width"], top + shape["resized_height"]
         canvas[top:bottom, left:right] = resized
-        valid[top:bottom, left:right] = True
+        valid[top:bottom, left:right] = resized_foreground
         tensors.append(torch.from_numpy(canvas.copy()).permute(2, 0, 1).float() / 255.0)
         valid_masks.append(valid)
         dynamic_masks.append(np.zeros_like(valid))
@@ -515,6 +579,8 @@ def _prepare_model_inputs(
                 "source_rgb": _root_relative(view["rgb"]),
                 "source_rgb_sha256": sha256_file(view["rgb"]),
                 "dynamic_fraction": 0.0,
+                "foreground_mask_policy": mask_policy,
+                "foreground_fraction_original": float(np.mean(foreground_original)),
             }
         )
     return (
@@ -660,15 +726,135 @@ def validate_genrecon_input_assets(
             raise RepresentativeInferenceError(f"GenRecon input asset changed: {path}")
 
 
-def _trajectory_json(alignment: dict[str, Any]) -> dict[str, Any]:
-    return {
+def validate_genrecon_camera_selection(
+    scene_dir: Path,
+    input_manifest: dict[str, Any],
+    preflight: dict[str, Any],
+) -> None:
+    contract = input_manifest.get("genrecon_camera_selection")
+    if contract is None:
+        if (
+            input_manifest.get("coordinate_units", "meters") != "meters"
+            or preflight.get("status") != "passed"
+            or preflight.get("closest_camera_fallback_count") != 0
+        ):
+            raise RepresentativeInferenceError(
+                "Legacy camera-selection compatibility is meter-coordinate only"
+            )
+        return
+    if not isinstance(contract, dict):
+        raise RepresentativeInferenceError("Invalid GenRecon camera-selection contract")
+    expected_area = float(contract.get("minimum_projected_chunk_area", -1.0))
+    if (
+        contract.get("policy") != "frustum-and-minimum-projected-chunk-area"
+        or not 0.0 <= expected_area <= 1.0
+        or contract.get("required_fallback_count") != 0
+        or preflight.get("closest_camera_fallback_count") != 0
+        or preflight.get("status") != "passed"
+    ):
+        raise RepresentativeInferenceError("Invalid GenRecon camera-selection contract")
+    preflight_selection = preflight.get("camera_selection", {})
+    if (
+        preflight_selection.get("policy")
+        != "frustum-and-minimum-projected-chunk-area"
+        or abs(
+            float(preflight_selection.get("minimum_projected_chunk_area", -1.0))
+            - expected_area
+        )
+        > 1e-12
+        or preflight_selection.get("required_fallback_count") != 0
+    ):
+        raise RepresentativeInferenceError("Preflight camera-selection contract differs")
+    camera_document = load_json(scene_dir / "genrecon_preflight" / "cameras.json")
+    chunk_records = camera_document.get("chunks")
+    if not isinstance(chunk_records, list) or len(chunk_records) != int(
+        preflight.get("chunk_count", -1)
+    ):
+        raise RepresentativeInferenceError("Preflight camera-selection audit is incomplete")
+    areas = []
+    for record in chunk_records:
+        selected = record.get("cond2d_view", {})
+        area = float(selected.get("projected_chunk_area", -1.0))
+        if (
+            selected.get("selection_mode") != "visible-projected-area"
+            or abs(
+                float(selected.get("minimum_projected_chunk_area", -1.0))
+                - expected_area
+            )
+            > 1e-12
+            or area < expected_area
+        ):
+            raise RepresentativeInferenceError(
+                "Preflight chunk did not pass projected-area camera selection"
+            )
+        areas.append(area)
+    if (
+        not areas
+        or abs(
+            float(preflight_selection.get("selected_projected_chunk_area_min", -1.0))
+            - min(areas)
+        )
+        > 1e-12
+        or abs(
+            float(preflight_selection.get("selected_projected_chunk_area_max", -1.0))
+            - max(areas)
+        )
+        > 1e-12
+        or preflight_selection.get("selected_chunks_meeting_area_gate") != len(areas)
+    ):
+        raise RepresentativeInferenceError("Preflight projected-area summary changed")
+
+
+def validate_normalized_object_foreground_masks(
+    scene_dir: Path, input_manifest: dict[str, Any]
+) -> None:
+    if input_manifest.get("coordinate_units") != "normalized-object":
+        return
+    views = input_manifest.get("views")
+    if not isinstance(views, list) or len(views) != 8:
+        raise RepresentativeInferenceError(
+            "Normalized-object input must record 8 foreground-masked views"
+        )
+    for record in views:
+        if (
+            record.get("foreground_mask_policy")
+            != "border-connected-exact-white-background-from-conditioning-rgb"
+        ):
+            raise RepresentativeInferenceError(
+                "Normalized-object foreground mask policy is missing"
+            )
+        source = _resolve_recorded_path(record["source_rgb"])
+        with Image.open(source) as opened:
+            expected = _white_background_foreground_mask(
+                np.asarray(opened.convert("RGB"))
+            )
+        output = scene_dir / "rgb" / record["output_name"]
+        with Image.open(output) as opened:
+            if opened.mode != "RGBA":
+                raise RepresentativeInferenceError(
+                    f"Normalized-object GenRecon input is not RGBA: {output}"
+                )
+            alpha = np.asarray(opened.getchannel("A")) > 0
+        if not np.array_equal(alpha, expected):
+            raise RepresentativeInferenceError(
+                f"Normalized-object alpha differs from RGB-derived foreground: {output}"
+            )
+        if abs(float(np.mean(expected)) - record.get("foreground_fraction_original", -1.0)) > 1e-12:
+            raise RepresentativeInferenceError(
+                f"Normalized-object foreground fraction changed: {output}"
+            )
+
+
+def _trajectory_json(
+    alignment: dict[str, Any], *, coordinate_units: str
+) -> dict[str, Any]:
+    result = {
         "method": "Umeyama Sim(3) from 8 conditioning camera centers only",
         "matched_conditioning_cameras": 8,
+        "coordinate_units": coordinate_units,
         "scale_predicted_to_official": alignment["scale"],
         "rotation_predicted_to_official": alignment["rotation"],
         "translation_predicted_to_official": alignment["translation"],
-        "target_baseline_diagonal_m": alignment["target_baseline_diagonal_m"],
-        "center_error_m": alignment["center_error_m"],
         "center_error_normalized_by_baseline": alignment[
             "center_error_normalized_by_baseline"
         ],
@@ -676,6 +862,23 @@ def _trajectory_json(alignment: dict[str, Any]) -> dict[str, Any]:
         "gt_geometry_icp_used": False,
         "heldout_cameras_used": False,
     }
+    if coordinate_units == "meters":
+        result.update(
+            {
+                "target_baseline_diagonal_m": alignment[
+                    "target_baseline_diagonal_m"
+                ],
+                "center_error_m": alignment["center_error_m"],
+            }
+        )
+    else:
+        result.update(
+            {
+                "target_baseline_diagonal": alignment["target_baseline_diagonal"],
+                "center_error": alignment["center_error"],
+            }
+        )
+    return result
 
 
 def _unit_reusable(
@@ -702,6 +905,7 @@ def _unit_reusable(
             return False
         validate_source_audit(manifest, manifest["source_audit"])
         validate_genrecon_input_assets(scene_dir, manifest)
+        validate_normalized_object_foreground_masks(scene_dir, manifest)
         return True
     except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
         return False
@@ -747,7 +951,11 @@ def prepare_unit(
             seed=candidate_seed(int(protocol["seed"]), unit_id),
         )
         official_c2w = np.stack([item["camera_to_world"] for item in contract["views"]])
-        alignment = trajectory_alignment(prediction["extrinsic"], official_c2w)
+        alignment = trajectory_alignment(
+            prediction["extrinsic"],
+            official_c2w,
+            coordinate_units=contract["coordinate_units"],
+        )
         pseudo_official, _ = transform_world_similarity(
             point_data["points_world"],
             prediction["extrinsic"],
@@ -812,12 +1020,23 @@ def prepare_unit(
         )
         gate_reasons = quality_gate["reasons"]
         grade = quality_gate["grade"]
+        camera_area_protocol_key = (
+            "normalized_object_minimum_projected_chunk_area"
+            if contract["coordinate_units"] == "normalized-object"
+            else "meter_coordinate_minimum_projected_chunk_area"
+        )
+        minimum_projected_chunk_area = float(protocol[camera_area_protocol_key])
+        if not 0.0 <= minimum_projected_chunk_area <= 1.0:
+            raise RepresentativeInferenceError(
+                f"{camera_area_protocol_key} must be in [0, 1]"
+            )
         manifest = {
             "schema": "genrecon.gt-representative-foundation-input",
             "schema_version": SCHEMA_VERSION,
             "unit_id": unit_id,
             "title": unit_id,
             "track": "GT-pose-foundation-pseudo-geometry",
+            "coordinate_units": contract["coordinate_units"],
             "build_contract": {
                 "tool_sha256": sha256_file(Path(__file__)),
                 "config_sha256": sha256_file(config_path),
@@ -845,15 +1064,30 @@ def prepare_unit(
                 "points_visible_in_official_conditioning_cameras": len(points_work),
                 "official_conditioning_camera_visible_fraction": visible_fraction,
             },
-            "trajectory_alignment": _trajectory_json(alignment),
+            "trajectory_alignment": _trajectory_json(
+                alignment, coordinate_units=contract["coordinate_units"]
+            ),
             "work_frame": {
+                "coordinate_units": contract["coordinate_units"],
                 "official_to_work": work_frame["official_to_work"],
                 "work_to_official": work_frame["work_to_official"],
                 "gravity_method": work_frame["gravity_method"],
                 "translation_method": work_frame["translation_method"],
-                "scale": "official metric scale preserved",
+                "scale": "declared coordinate-unit scale preserved",
             },
             "colmap_export": colmap_metrics,
+            "genrecon_camera_selection": {
+                "policy": "frustum-and-minimum-projected-chunk-area",
+                "minimum_projected_chunk_area": minimum_projected_chunk_area,
+                "required_fallback_count": int(
+                    protocol["required_preflight_fallbacks"]
+                ),
+                "rationale": (
+                    "small-object-frustum-visibility"
+                    if contract["coordinate_units"] == "normalized-object"
+                    else "room-scale-default"
+                ),
+            },
             "genrecon_input_assets": genrecon_input_asset_records(scene_dir),
             "quality_gate": quality_gate,
             "limitations": [
@@ -1109,19 +1343,56 @@ def representative_input_contract_sha256(document: dict[str, Any]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def validate_reconstruction_camera_selection(
+    reconstruction: Path,
+    scene_dir: Path,
+    input_manifest: dict[str, Any],
+) -> None:
+    contract = input_manifest.get("genrecon_camera_selection")
+    if contract is None:
+        if input_manifest.get("coordinate_units", "meters") != "meters":
+            raise RepresentativeInferenceError(
+                "Normalized-object reconstruction lacks a camera-selection contract"
+            )
+        return
+    preflight = load_json(scene_dir / "genrecon_preflight" / "preflight.json")
+    validate_genrecon_camera_selection(scene_dir, input_manifest, preflight)
+    args = load_json(reconstruction / "args.json")
+    expected_area = float(contract["minimum_projected_chunk_area"])
+    if abs(float(args.get("min_projected_chunk_area", -1.0)) - expected_area) > 1e-12:
+        raise RepresentativeInferenceError(
+            "Reconstruction projected-area threshold differs from input contract"
+        )
+    preflight_cameras = load_json(scene_dir / "genrecon_preflight" / "cameras.json")
+    reconstruction_cameras = load_json(reconstruction / "cameras.json")
+    if reconstruction_cameras != preflight_cameras:
+        raise RepresentativeInferenceError(
+            "Reconstruction camera selections differ from zero-fallback preflight"
+        )
+
+
 def package_prediction(
     unit_id: str, input_root: Path, prediction_root: Path, *, force: bool
 ) -> dict[str, Any]:
     input_manifest_path = input_root / "candidates" / unit_id / "manifest.json"
     input_manifest = load_json(input_manifest_path)
+    scene_dir = input_manifest_path.parent
     reconstruction = prediction_root / "candidates" / unit_id / "reconstruction"
     source_mesh = reconstruction / "mesh.ply"
     source_glb = reconstruction / "scene.glb"
-    if not source_mesh.is_file() or not source_glb.is_file():
+    source_args = reconstruction / "args.json"
+    source_cameras = reconstruction / "cameras.json"
+    if not all(path.is_file() for path in (source_mesh, source_glb, source_args, source_cameras)):
         raise RepresentativeInferenceError(f"GenRecon reconstruction is incomplete for {unit_id}")
+    validate_reconstruction_camera_selection(reconstruction, scene_dir, input_manifest)
     package = prediction_root / "candidates" / unit_id / "prediction_official"
     package_manifest_path = package / "manifest.json"
-    source_hashes = {"mesh": sha256_file(source_mesh), "glb": sha256_file(source_glb)}
+    source_hashes = {
+        "mesh": sha256_file(source_mesh),
+        "glb": sha256_file(source_glb),
+        "args": sha256_file(source_args),
+        "cameras": sha256_file(source_cameras),
+    }
     matrix = _finite_matrix(
         input_manifest["work_frame"]["work_to_official"],
         (4, 4),
@@ -1159,6 +1430,7 @@ def package_prediction(
         "unit_id": unit_id,
         "track": "GT-pose-foundation-pseudo-geometry",
         "coordinate_frame": "declared calibration/reference frame",
+        "coordinate_units": input_manifest.get("coordinate_units", "meters"),
         "alignment": {
             "method": "conditioning-camera-only Sim(3), followed by exact work-to-official inverse",
             "work_to_official": matrix,
@@ -1171,6 +1443,14 @@ def package_prediction(
             "sha256": source_hashes,
             "input_manifest": _root_relative(input_manifest_path),
             "input_manifest_contract_sha256": input_contract,
+            "camera_selection": input_manifest.get(
+                "genrecon_camera_selection",
+                {
+                    "policy": "legacy-room-scale-default",
+                    "minimum_projected_chunk_area": 0.4,
+                    "required_fallback_count": 0,
+                },
+            ),
         },
         "outputs": {
             "mesh": {"path": "mesh.ply", **mesh_record},
@@ -1279,15 +1559,29 @@ def validate_prediction_package(package: Path, unit_id: str) -> Path:
     source = document.get("source", {})
     reconstruction = _resolve_recorded_path(source.get("reconstruction", ""))
     input_manifest = _resolve_recorded_path(source.get("input_manifest", ""))
+    input_document = load_json(input_manifest) if input_manifest.is_file() else None
+    if input_document is not None:
+        expected_coordinate_units = input_document.get("coordinate_units", "meters")
+        if document.get("coordinate_units", "meters") != expected_coordinate_units:
+            raise RepresentativeInferenceError(
+                f"Prediction package coordinate units mismatch: {package}"
+            )
     if (
         not input_manifest.is_file()
-        or representative_input_contract_sha256(load_json(input_manifest))
+        or input_document is None
+        or representative_input_contract_sha256(input_document)
         != source.get("input_manifest_contract_sha256")
     ):
         raise RepresentativeInferenceError(
             f"Prediction package input manifest changed: {input_manifest}"
         )
-    for key, name in (("mesh", "mesh.ply"), ("glb", "scene.glb")):
+    source_names = [("mesh", "mesh.ply"), ("glb", "scene.glb")]
+    strict_camera_selection = (
+        input_document.get("coordinate_units", "meters") == "normalized-object"
+    )
+    if strict_camera_selection:
+        source_names.extend([("args", "args.json"), ("cameras", "cameras.json")])
+    for key, name in source_names:
         source_path = reconstruction / name
         if (
             not source_path.is_file()
@@ -1295,6 +1589,17 @@ def validate_prediction_package(package: Path, unit_id: str) -> Path:
         ):
             raise RepresentativeInferenceError(
                 f"Prediction package source {key} changed: {source_path}"
+            )
+    if strict_camera_selection:
+        validate_reconstruction_camera_selection(
+            reconstruction,
+            input_manifest.parent,
+            input_document,
+        )
+        expected_camera_selection = input_document["genrecon_camera_selection"]
+        if source.get("camera_selection") != expected_camera_selection:
+            raise RepresentativeInferenceError(
+                f"Prediction package camera-selection contract mismatch: {package}"
             )
     mesh = package / document["outputs"]["mesh"]["path"]
     glb = package / document["outputs"]["glb"]["path"]
@@ -1346,8 +1651,8 @@ def validate_all(
                 raise RepresentativeInferenceError("forbidden GT/heldout inputs appear in source audit")
             validate_source_audit(manifest, audit)
             validate_genrecon_input_assets(scene, manifest)
-            if preflight.get("status") != "passed" or preflight.get("closest_camera_fallback_count") != 0:
-                raise RepresentativeInferenceError("preflight is not a zero-fallback pass")
+            validate_normalized_object_foreground_masks(scene, manifest)
+            validate_genrecon_camera_selection(scene, manifest, preflight)
             counts["completed_inputs"] += 1
             counts["zero_fallback_preflights"] += 1
             counts["conditioning_rgb"] += 8

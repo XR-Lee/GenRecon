@@ -375,6 +375,7 @@ def validate_release(output: Path) -> dict[str, Any]:
     if len({entry["dataset"] for entry in representatives}) != 7:
         errors.append("index does not contain seven unique datasets")
     registry_units = {row["unit_id"]: row for row in registry["units"]}
+    plan_by_unit = {entry["unit_id"]: entry for entry in plan_entries}
 
     expected_build_contract = {
         "plan_sha256": index.get("plan_sha256"),
@@ -401,9 +402,22 @@ def validate_release(output: Path) -> dict[str, Any]:
             continue
         document = load_json(manifest_path)
         candidate_documents.append(document)
-        for key in ("dataset", "dataset_label", "unit_id", "scene_label", "status", "prediction_status"):
+        for key in (
+            "dataset",
+            "dataset_label",
+            "unit_id",
+            "scene_label",
+            "status",
+            "prediction_status",
+            "review_status",
+        ):
             if document.get(key) != representative.get(key):
                 errors.append(f"{unit_id}: index/candidate mismatch for {key}")
+        expected_review = plan_by_unit.get(unit_id, {}).get(
+            "review_status", "not-reviewed"
+        )
+        if document.get("review_status") != expected_review:
+            errors.append(f"{unit_id}: candidate review status differs from frozen plan")
         if document.get("build_contract") != expected_build_contract:
             errors.append(f"{unit_id}: candidate build contract is stale")
         registry_row = registry_units.get(unit_id)

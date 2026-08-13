@@ -9,7 +9,10 @@ import numpy as np
 import torch
 from PIL import Image
 
-from genrecon.datasets.components import chunk_visible_in_camera
+from genrecon.datasets.components import (
+    chunk_visible_in_camera,
+    projected_chunk_area_in_camera,
+)
 from genrecon.pipelines.types import SelectedImages
 
 # ScanNet++ Nerfstudio DSLR poses are stored in a world frame that differs from
@@ -36,6 +39,8 @@ def _to_chunk0_extrinsics(c2w_world: torch.Tensor, m_o2c_0: torch.Tensor) -> tor
 
 
 class BaseImageSelecter:
+    min_projected_chunk_area: float = 0.4
+
     def _prepare_scene_pool(self, scene_picks_raw: list[dict]) -> list[dict]:
         """Hook for subclasses that want to expand the scene pool before image
         loading (e.g. iPhone two-crop). Default is identity — non-iPhone
@@ -122,7 +127,11 @@ class BaseImageSelecter:
 
     def _check_acceptance(self, transf_extr: torch.Tensor, intr: torch.Tensor) -> bool:
         """Chunk is visible from the given camera (frustum + projected-area threshold)."""
-        return chunk_visible_in_camera(transf_extr, intr)
+        return chunk_visible_in_camera(
+            transf_extr,
+            intr,
+            min_area=self.min_projected_chunk_area,
+        )
 
     def _pick_cond2d_for_chunk(
         self,
@@ -139,12 +148,17 @@ class BaseImageSelecter:
         visibility — keeps every chunk in play instead of dropping it.
         """
 
-        def _pack(cam: dict) -> dict:
+        def _pack(cam: dict, *, selection_mode: str) -> dict:
+            ext_i = _FLIP_Y_Z @ torch.linalg.inv(m_o2c_i @ cam["c2w_blender"])
             return {
                 "img_path": cam["img_path"],
                 "intrinsics": cam["intrinsics"],
                 "extrinsics_c0": _to_chunk0_extrinsics(cam["c2w_blender"], m_o2c_0),
                 "crop_box": cam.get("crop_box"),
+                "selection_mode": selection_mode,
+                "projected_chunk_area": projected_chunk_area_in_camera(
+                    ext_i, cam["intrinsics"]
+                ),
             }
 
         camera_indices = list(range(len(cameras)))
@@ -153,7 +167,7 @@ class BaseImageSelecter:
             cam = cameras[idx]
             ext_i = _FLIP_Y_Z @ torch.linalg.inv(m_o2c_i @ cam["c2w_blender"])
             if self._check_acceptance(ext_i, cam["intrinsics"]):
-                return _pack(cam)
+                return _pack(cam, selection_mode="visible-projected-area")
 
         # No camera is strictly visible — fall back to the closest one.
         best_idx = min(
@@ -165,7 +179,7 @@ class BaseImageSelecter:
             f"[get_images] {tag}: no visible camera in scene_picks; "
             f"falling back to closest camera ({Path(cameras[best_idx]['img_path']).name})."
         )
-        return _pack(cameras[best_idx])
+        return _pack(cameras[best_idx], selection_mode="closest-camera-fallback")
 
     def _sample_scene_cameras(
         self,
@@ -322,6 +336,11 @@ class BaseImageSelecter:
                                 "img_path": cond2d_picks[i]["img_path"],
                                 "extrinsics_c0": cond2d_ext_c0_list[i].tolist(),
                                 "intrinsics": cond2d_intr_stack[i].tolist(),
+                                "selection_mode": cond2d_picks[i]["selection_mode"],
+                                "projected_chunk_area": cond2d_picks[i][
+                                    "projected_chunk_area"
+                                ],
+                                "minimum_projected_chunk_area": self.min_projected_chunk_area,
                             },
                         }
                         for i in range(len(cond2d_picks))
@@ -729,6 +748,7 @@ class ScannetIphoneImageSelecter(_IphoneSelecterMixin, BaseImageSelecter, Scanne
         self,
         undistort_cache_dir: Path | str | None = None,
         center_crop: bool = False,
+        min_projected_chunk_area: float = 0.4,
     ):
         """
         Args:
@@ -746,6 +766,9 @@ class ScannetIphoneImageSelecter(_IphoneSelecterMixin, BaseImageSelecter, Scanne
             Path(undistort_cache_dir) if undistort_cache_dir is not None else _DEFAULT_IPHONE_UNDISTORT_CACHE
         )
         self.center_crop = center_crop
+        self.min_projected_chunk_area = float(min_projected_chunk_area)
+        if not 0.0 <= self.min_projected_chunk_area <= 1.0:
+            raise ValueError("min_projected_chunk_area must be in [0, 1]")
 
 
 class IphoneMixin(ScannetIphoneMixin):
@@ -761,7 +784,11 @@ class IphoneMixin(ScannetIphoneMixin):
 
 
 class IphoneImageSelecter(_IphoneSelecterMixin, BaseImageSelecter, IphoneMixin):
-    def __init__(self, center_crop: bool = False):
+    def __init__(
+        self,
+        center_crop: bool = False,
+        min_projected_chunk_area: float = 0.4,
+    ):
         """
         Args:
             center_crop: if True, fall back to the legacy single-square crop
@@ -770,3 +797,6 @@ class IphoneImageSelecter(_IphoneSelecterMixin, BaseImageSelecter, IphoneMixin):
         """
         super().__init__()
         self.center_crop = center_crop
+        self.min_projected_chunk_area = float(min_projected_chunk_area)
+        if not 0.0 <= self.min_projected_chunk_area <= 1.0:
+            raise ValueError("min_projected_chunk_area must be in [0, 1]")

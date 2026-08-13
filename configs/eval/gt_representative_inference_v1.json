@@ -5,14 +5,15 @@
     "tanks-and-temples-meetingroom",
     "seven-scenes-chess",
     "redwood-livingroom",
-    "dtu-scan24"
+    "dtu-scan24",
+    "omniobject3d-bottle_045"
   ],
   "protocol": {
     "seed": 42,
     "conditioning_views": 8,
     "geometry_source": "VGGT-1B from conditioning RGB only",
     "camera_alignment": "Umeyama Sim(3) from conditioning camera centers only",
-    "work_frame": "metric z-up derived from conditioning cameras and pseudo points",
+    "work_frame": "coordinate-unit-preserving z-up derived from conditioning cameras and pseudo points",
     "heldout_rgb_used": false,
     "conditioning_depth_used": false,
     "heldout_depth_used": false,
@@ -32,6 +33,8 @@
     "max_rotation_error_p90_deg": 35.0,
     "genrecon_views": 8,
     "required_preflight_fallbacks": 0,
+    "meter_coordinate_minimum_projected_chunk_area": 0.4,
+    "normalized_object_minimum_projected_chunk_area": 0.2,
     "prediction_coordinate_frame": "declared calibration/reference frame",
     "glb_texture_size": 4096,
     "glb_simplify_threshold_per_chunk": 300000
