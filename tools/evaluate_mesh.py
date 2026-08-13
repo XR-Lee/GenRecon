@@ -253,8 +253,6 @@ def evaluate_meshes(
         raise ValueError("workers must be -1 or a positive integer")
     thresholds_m = tuple(float(value) for value in thresholds_m)
     normalized_thresholds = tuple(float(value) for value in normalized_thresholds)
-    if not thresholds_m:
-        raise ValueError("At least one absolute evaluation threshold is required")
 
     predicted = _as_single_mesh(predicted_mesh, label="predicted")
     ground_truth = _as_single_mesh(ground_truth_mesh, label="ground-truth")

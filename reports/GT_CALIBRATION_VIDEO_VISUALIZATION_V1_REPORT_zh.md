@@ -4,14 +4,13 @@
 
 已经为冻结 GT calibration suite 的 7 个数据集建立统一视频审查入口：
 
-- 可用真实数据集代表：6 个；
-- 授权阻塞代表：OmniObject3D 1 个；
-- 每个可用代表使用冻结的 8 conditioning + 8 heldout 相机，共 96 个真实相机帧；
-- 每个可用代表输出 `source.mp4`、`reference.mp4`、`prediction.mp4`、`comparison.mp4`；
-- 6 个可用代表均有 registry-backed GenRecon prediction render，0 个 `missing-prediction`；
+- 真实 prepared 数据集代表：7 个，source blocker 为 0；
+- 每个代表使用冻结的 8 conditioning + 8 heldout 相机，共 112 个真实相机帧；
+- 每个代表输出 `source.mp4`、`reference.mp4`、`prediction.mp4`、`comparison.mp4`；
+- 6 个代表有 registry-backed GenRecon prediction render；OmniObject3D `bottle_045` 有真实 RGB/camera/reference package，第三栏为显式 `missing-prediction` status card；
 - T&T、7-Scenes、Redwood、DTU 的新增 prediction 只由 8 张 conditioning RGB 和 conditioning camera records 构建，不读取 heldout RGB/depth、conditioning depth 或 reference geometry；
-- OmniObject3D 仍为 `blocked-auth`，只输出授权状态视频，不展示虚构 RGB、object ID、scan 或 prediction；
-- 总计 26 个 H.264/yuv420p 视频、53,315,310 bytes，完整解码 496 帧；
+- Omni reference 使用 official professional scan 在 audited normalized-object render frame 中的同相机渲染，绝不冒充 prediction 或 conditioning；
+- 总计 29 个 H.264/yuv420p 视频、54,100,208 bytes，完整解码 560 帧；
 - 内部 validation 与独立 release validation 均为 `pass`，`errors=[]`。
 
 浏览入口：
@@ -26,7 +25,7 @@
 
 1. `REFERENCE RGB`：calibration package 中冻结的原始 conditioning/heldout 图像；
 2. `GT / REFERENCE GEOMETRY`：按同一冻结相机渲染的评测 reference，只用于可视化与评测；
-3. `GENRECON PREDICTION`：只渲染 registry 中具有完整 prediction package provenance 的 mesh；registry membership、路径、SHA 或 package source chain 不一致时 exporter/validator 失败。
+3. `GENRECON PREDICTION`：只渲染 registry 中具有完整 prediction package provenance 的 mesh；registry membership、路径、SHA 或 package source chain 不一致时 exporter/validator 失败。若 registry 明确没有 prediction，则该栏只能输出 `missing-prediction` status card，不能渲染 reference geometry。
 
 所有视频遵循：
 
@@ -44,15 +43,15 @@ ScanNet++ 的 frozen RGB 使用 manifest 中 OPENCV 参数去畸变后进入展�
 
 | 数据集 | 代表场景 | GT 层级 | Reference render | Prediction | Reference min / median | Prediction min / median | 主视频 SHA256 |
 |---|---|---|---|---|---:|---:|---|
-| ScanNet++ | `286b55a2bf` | G0 | laser scan mesh | available | 0.7527 / 0.9218 | 0.9954 / 1.0000 | `be5eba47787e28fa8784dbb4b398a8fed49d0161ab2b72819cf8e792069aa6d7` |
-| ETH3D | `delivery_area` | G0 | 2 aligned laser point clouds | available | 0.7403 / 0.8457 | 0.2746 / 0.5322 | `468823d0a822c34d85d1e19bec45cce990c1d4eb3d0a455082fb9a164aca0b00` |
-| Tanks and Temples | `Meetingroom` | G0 | official-crop 1 cm laser points | available | 0.8974 / 0.9472 | 0.7057 / 0.8396 | `c026f4b34e1f52f6ee808544707339b998849608e7b978b29aad074f1ee26410` |
-| 7-Scenes | `chess` | G1 | clean-depth fusion points | available | 0.5823 / 0.7977 | 0.3106 / 0.6926 | `40a74e0fcc8b8470136aca389540f713470b92670a7a8dfe836fd7eff8e7b351` |
-| Redwood | `livingroom` | G2 | exact synthetic points | available | 0.8285 / 0.9602 | 0.3345 / 0.8367 | `784dfd11e9b032ae3f5922dc8436df74b6e41a3b002858481c7037c3a38388c9` |
-| DTU MVS | `scan24` | O0 | structured-light points | available | 0.4111 / 0.8074 | 0.4634 / 0.6500 | `eff0e77c7170a536ed1ffa567b49524a4168c613df4d6ed58abc6ad84eeb5e3a` |
-| OmniObject3D | requested bottle slot | O0 | unavailable | blocked-auth | 不适用 | 不适用 | `6724cf44dc7c901bbad30ee410c74094895f0d3f77c886f6b3e399d26c9b4827` |
+| ScanNet++ | `286b55a2bf` | G0 | laser scan mesh | available | 0.7527 / 0.9147 | 0.9954 / 1.0000 | `be5eba47787e28fa8784dbb4b398a8fed49d0161ab2b72819cf8e792069aa6d7` |
+| ETH3D | `delivery_area` | G0 | 2 aligned laser point clouds | available | 0.7403 / 0.8432 | 0.2746 / 0.5320 | `468823d0a822c34d85d1e19bec45cce990c1d4eb3d0a455082fb9a164aca0b00` |
+| Tanks and Temples | `Meetingroom` | G0 | official-crop 1 cm laser points | available | 0.8974 / 0.9427 | 0.7057 / 0.8327 | `c026f4b34e1f52f6ee808544707339b998849608e7b978b29aad074f1ee26410` |
+| 7-Scenes | `chess` | G1 | clean-depth fusion points | available | 0.5823 / 0.7938 | 0.3106 / 0.6872 | `40a74e0fcc8b8470136aca389540f713470b92670a7a8dfe836fd7eff8e7b351` |
+| Redwood | `livingroom` | G2 | exact synthetic points | available | 0.8285 / 0.9466 | 0.3345 / 0.8313 | `784dfd11e9b032ae3f5922dc8436df74b6e41a3b002858481c7037c3a38388c9` |
+| DTU MVS | `scan24` | O0 | structured-light points | available | 0.4111 / 0.7790 | 0.4634 / 0.6322 | `eff0e77c7170a536ed1ffa567b49524a4168c613df4d6ed58abc6ad84eeb5e3a` |
+| OmniObject3D | `bottle_045` | O0 | normalized professional scan mesh | missing-prediction | 0.0460 / 0.1163 | 不适用 | `f42ec8aaaa9b5233b00da4d72ab80dd5208dc92adf00764eb42aef3ffb5d8366` |
 
-这里的 coverage 是 reference/prediction render mask 在 640x480 panel 中的像素占比，只用于发现空帧、相机错位或异常包围，不是 F-score、recall 或完整度指标。所有 coverage 均原样保留，未用 GT AABB 裁掉 prediction。全 release 的 reference coverage 为 0.4111/0.8713/0.9988（min/median/max），prediction 为 0.2746/0.7702/1.0000。
+这里的 coverage 是 reference/prediction render mask 在 640x480 panel 中的像素占比，只用于发现空帧、相机错位或异常包围，不是 F-score、recall 或完整度指标。所有 coverage 均原样保留，未用 GT AABB 裁掉 prediction。全 release 的 reference coverage 为 0.0460/0.8414/0.9988（min/median/max），prediction 为 0.2746/0.7702/1.0000。Omni object 在画面中占比较小，因此降低全局 reference minimum；这不是空白帧。
 
 ## 4. 人工目检
 
@@ -64,7 +63,7 @@ ScanNet++ 的 frozen RGB 使用 manifest 中 OPENCV 参数去畸变后进入展�
 - 7-Scenes：棋桌、显示器、红墙和白板在 RGB/reference/prediction 中保持同一视向，prediction 存在局部缺失和生成表面；
 - Redwood：椅子、窗帘、灯具和墙角的视向一致；该输入是低重叠 `P-C marginal`，视频不能把模型内部自洽解释为真实精度；
 - DTU：相机方向与建筑模型位置正确，但 prediction 出现大面积绿色/白色背景平面并遮挡建筑，属于真实 hallucination；F@10 cm 较高不能覆盖这一视觉失败；
-- OmniObject3D：只显示授权 blocker，未将语义请求槽位冒充官方 object ID。
+- OmniObject3D：`bottle_045` 的绿色瓶身、浅色瓶盖和视向在 RGB 与 normalized scan silhouette 中一致；conditioning/heldout 均显示真实冻结相机，第三栏持续显示 `NO GENRECON PREDICTION`，没有用 GT mesh 填充。
 
 ## 5. 验证
 
@@ -73,16 +72,16 @@ ScanNet++ 的 frozen RGB 使用 manifest 中 OPENCV 参数去畸变后进入展�
 | 检查项 | 结果 |
 |---|---:|
 | Dataset statuses | 7 |
-| Available / blocked | 6 / 1 |
-| With prediction / missing prediction | 6 / 0 |
-| Frozen camera frames | 96 |
-| Candidate videos | 25 |
+| Available / blocked | 7 / 0 |
+| With prediction / missing prediction | 6 / 1 |
+| Frozen camera frames | 112 |
+| Candidate videos | 28 |
 | Overview videos | 1 |
-| Candidate decoded frames | 392 |
-| Overview decoded frames | 104 |
-| Total decoded frames | 496 |
-| Video bytes | 53,315,310 |
-| Reference coverage min / median / max | 0.4111 / 0.8713 / 0.9988 |
+| Candidate decoded frames | 448 |
+| Overview decoded frames | 112 |
+| Total decoded frames | 560 |
+| Video bytes | 54,100,208 |
+| Reference coverage min / median / max | 0.0460 / 0.8414 / 0.9988 |
 | Prediction coverage min / median / max | 0.2746 / 0.7702 / 1.0 |
 | Result | `pass` |
 
@@ -90,22 +89,22 @@ release validator 重新检查：
 
 - visualization plan、GT registry 和 exporter SHA256；
 - 7 个代表与冻结 plan/registry 的 membership、顺序、状态；
-- 96 个源 RGB、source frame、reference frame、prediction frame 和 comparison frame 的 SHA256；
-- reference geometry 与完整 prediction source chain：unit manifest、work-frame PLY/GLB、official-frame PLY/PBR GLB、package manifest、4x4 transform 和 input-contract SHA；
+- 112 个源 RGB、source frame、reference frame、prediction/status frame 和 comparison frame 的 SHA256；
+- reference geometry 与 6 个完整 prediction source chains：unit manifest、work-frame PLY/GLB、official-frame PLY/PBR GLB、package manifest、4x4 transform 和 input-contract SHA；
+- Omni `missing-prediction` 必须没有 geometry source、numeric prediction coverage 或伪造 prediction provenance；
 - conditioning/heldout 严格 8+8 顺序；
-- prepared 数据集每路视频恰好 16 帧；
-- Omni blocker 视频恰好 8 帧；
-- 总览视频恰好 104 帧；
-- 26 个 MP4 的 SHA256、字节数、分辨率、fps、逐帧完整解码和非空画面。
+- 每个 prepared 数据集每路视频恰好 16 帧；
+- 总览视频恰好 112 帧；
+- 29 个 MP4 的 SHA256、字节数、分辨率、fps、逐帧完整解码和非空画面。
 
 关键 SHA256：
 
-- plan：`a7c4288ec63d7004288cf17735bcefa19e70665094e28c0e350def8c3e3bef3d`
-- index：`56a374217b98dcc51b3baa2a7dcb2fd86a2478919e8173b5a2c8a61cbc527ffe`
-- internal validation：`fae6e08349f1426ab240a988466e9c023105e6cad76f8b716fb49c7fb747c0e8`
-- overview MP4：`3d917d10a4b124076abefded96bacb8a767d254d26d7f84447ca411db956a2c2`
-- dataset contact：`b731e12090f19c506082e38f22907a16960e0084dfc3fe8b802a32265d1abbc2`
-- release validation：`22b55528147d89c3417a159e370bbe7524aca917827193b0dbc8c1e5c6d99b1d`
+- plan：`a96e20d4ba0151510f989484b13e79e952aa33ee2a75a357c519504d07b1bab8`
+- index：`a608d6c8d8cb4bf8ec4582ef42ba36b6a84f89d3a3aec9e6450225755fd973ef`
+- internal validation：`6bdae2e30043e3b29bb1506f1ab78c755be9db3c802c9f53d88f149a84a58946`
+- overview MP4：`7bf3afd03066de7fd36e68dbe301577877f01be1583027dc642e81fc3615e18c`
+- dataset contact：`f8cafabaf6ab58b7f7836bf87fd3708cb461ae7f5fa33bfa02c9a6e527789f86`
+- release validation：`ba4e6f2dd3b25c9abf45118d90c59be2986fe796f46ae73ec38e135e75722464`
 
 ## 6. 复现入口
 
@@ -129,8 +128,9 @@ EGL_PLATFORM=surfaceless .venv/bin/python \
 
 1. 四个新增 prediction 只能称为 8-view RGB-only、conditioning-camera-aligned 的 `GT-pose-foundation-pseudo-geometry` 结果，不能称为 estimated-pose 端到端结果。
 2. 四者未读取 heldout RGB/depth、conditioning depth、GT laser/fusion/structured-light reference 或 GT ICP；但 foundation-only conditioning RGB 已参与 VGGT geometry，因此不能称为 geometry-independent conditioning evidence。
-3. OmniObject3D 未授权前没有代表 RGB、相机和 dense scan；当前 blocker 视频不代表数据已下载。
-4. `GT / REFERENCE GEOMETRY` 栏不是模型输出，也不进入纹理/图像质量比较。
-5. 视频是 sparse frozen-camera inspection，不是连续时序、真实帧率或自由视角 fly-through。
-6. 视觉同位、nonblank validator 和 render coverage 不能替代 2/5/10 cm、completion/hallucination、heldout full-GT-mask RGB/depth 或 pose 指标。
-7. DTU 的背景平面 hallucination 必须与其几何分数同时报告，不能以 F@10 cm 或 coverage 将其判为视觉成功。
+3. OmniObject3D `bottle_045` 已有官方 100-view RGB/camera 与 normalized scan package，但尚未运行 GenRecon；第三栏必须保持 `missing-prediction`，不能用 reference geometry 代替。
+4. Omni RGB 与 scan 来自同一对象，heldout 只用于同相机审查，不是 geometry-independent evidence；其坐标也不是米制。
+5. `GT / REFERENCE GEOMETRY` 栏不是模型输出，也不进入纹理/图像质量比较。
+6. 视频是 sparse frozen-camera inspection，不是连续时序、真实帧率或自由视角 fly-through。
+7. 视觉同位、nonblank validator 和 render coverage 不能替代 2/5/10 cm、normalized-object、completion/hallucination、heldout full-GT-mask RGB/depth 或 pose 指标。
+8. DTU 的背景平面 hallucination 必须与其几何分数同时报告，不能以 F@10 cm 或 coverage 将其判为视觉成功。

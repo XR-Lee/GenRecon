@@ -13,26 +13,33 @@ calibration plan in `configs/eval/gt_calibration_v1.json`.
 | 7-Scenes | G1 | 7 | 7 | 1 | `chess` representative evaluated; six await reconstruction |
 | Redwood synthetic | G2 | 2 | 2 | 1 | `livingroom` representative evaluated; one awaits reconstruction |
 | DTU | O0 | 15 | 15 | 1 | `scan24` representative evaluated; 14 await reconstruction |
-| OmniObject3D requested slots | O0 | 24 | 0 | 0 | OpenXLab login and AK/SK required |
-| **Total** | | **76** | **52** | **26** | **24 declared blockers; 26 prepared units await prediction** |
+| OmniObject3D official objects | O0 | 24 | 24 | 0 | Complete RGB/cameras/normalized scan packages; all await reconstruction |
+| **Total** | | **76** | **76** | **26** | **50 prepared units await prediction; no source blocker** |
 
 `prepared` means the requested input split, camera metadata, reference geometry,
 source provenance and strict manifest are available. It does not mean that a
 GenRecon reconstruction has already been run. The current prepared set contains
-415 conditioning and 415 heldout images; ETH3D `pipes` has 7+7 because the
+607 conditioning and 607 heldout images; ETH3D `pipes` has 7+7 because the
 public registered sequence contains only 14 views. T&T Meetingroom contributes
-8+8 undistorted views in the official laser-GT frame.
+8+8 undistorted views in the official laser-GT frame. Each OmniObject3D unit
+contributes 8+8 white-background RGB renders and official cameras in a
+normalized-object frame; official depth EXRs are used only for masks/alignment
+audit and are not exported as conditioning.
 
 ## Validation
 
-- `validation.json`: `pass`; 76 manifests, 58 reference files, 339,797,392
-  reference vertices, 78,818,470 faces, 830 decoded RGB views, 464 decoded
-  depth maps, 26 prediction files totaling 12,059,314,964 bytes, and 147 strict
-  JSON files.
-- `source_validation.json`: `pass`; 33 source archives/videos and 39,113,567,386
-  bytes checked with ZIP/7z CRC or video sample decoding. T&T image/video MD5
-  values match the official GCS metadata; the imported 11-scan ZIP, scanner
-  positions, alignment Sim(3), and fixed-pose intrinsics artifact also validate.
+- `validation.json`: `pass`; 76 manifests, 82 reference files, 351,284,071
+  reference vertices, 101,807,332 faces, 1,214 decoded RGB views, 464 decoded
+  depth maps, 26 prediction files totaling 12,059,314,964 bytes, 24 deep Omni
+  package contracts, and 197 strict JSON files.
+- `source_validation.json`: `pass`; 71 source archives/videos and 80,772,051,894
+  bytes checked. This includes 22 ZIP CRC checks, 10 7z CRC checks, one video
+  sample decode, and 38 TAR/GZip stream/path-safety checks bound to the OpenXLab
+  metadata index. All 12 selected full-render archives, 12 selected raw-scan
+  archives, 24 exact 100-RGB/100-normal/100-depth/transforms payloads, and 24
+  `Scan.obj` payloads validate. T&T image/video MD5 values match official GCS
+  metadata; its 11-scan ZIP, scanner positions, alignment Sim(3), and fixed-pose
+  intrinsics artifact also validate.
 - `sources/tanks-and-temples/Meetingroom_individual_scans.previous-quota-response.html`
   preserves the old 2,009-byte quota response only as resolved download history.
   It is not a blocker and is not treated as GT.
@@ -96,4 +103,8 @@ Point-cloud GT has no fabricated normal score; the field is `null`.
 - DTU `scan24` has a high F@10 cm value but visibly contains large green/white
   background planes that occlude the building. The geometry score does not
   override this hallucination finding.
+- OmniObject3D uses `normalized-object` coordinates and bbox-diagonal normalized
+  thresholds only; its units must not be reported in meters or merged with DTU
+  despite sharing the `O0` provenance tier. The 100-view RGB and scans come from
+  the same object, so heldout RGB is not geometry-independent evidence.
 - Dataset licenses and terms remain attached to every source and derivative.

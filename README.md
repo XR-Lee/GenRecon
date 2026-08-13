@@ -237,18 +237,23 @@ PYTHONPATH=/tmp/pycolmap-wheel .venv/bin/python \
 .venv/bin/python tools/validate_gt_calibration_sources.py
 ```
 
-The current local build has 52 complete calibration packages and 24
-OmniObject3D request slots blocked on OpenXLab authentication. Tanks and Temples
-Meetingroom now includes the official individual scans/alignment, fixed-pose
+The current local build has all 76 calibration packages prepared. The 24
+OmniObject3D units use official object IDs and the official 100-view
+reconstruction assets: white-background RGB and cameras are exported, the
+professional scan is normalized into the audited render frame, and depth EXRs
+remain audit-only rather than GenRecon conditioning. Tanks and Temples
+Meetingroom includes the official individual scans/alignment, fixed-pose
 intrinsics calibration, undistorted 8+8 inputs, and an official-crop 1 cm laser
-reference. The registry now contains 26 evaluated predictions: 22 legacy G0
+reference. The registry contains 26 evaluated predictions: 22 legacy G0
 predictions plus four representative RGB-only runs for Meetingroom, 7-Scenes
-`chess`, Redwood `livingroom`, and DTU `scan24`. Those four runs use only the
-frozen eight conditioning RGB images and conditioning camera records; VGGT-1B
-pseudo geometry is aligned by a conditioning-camera-only Sim(3), with no
-heldout RGB/depth, reference geometry, or GT ICP. Protocol scope, GT tier,
-scene/instance unit type, and prediction-generation track are never merged into
-one score. See `reports/GT_CALIBRATION_V1_REPORT_zh.md` and
+`chess`, Redwood `livingroom`, and DTU `scan24`. The remaining 50 prepared units,
+including all 24 OmniObject3D objects, are explicitly `missing-prediction`.
+Those four runs use only the frozen eight conditioning RGB images and
+conditioning camera records; VGGT-1B pseudo geometry is aligned by a
+conditioning-camera-only Sim(3), with no heldout RGB/depth, reference geometry,
+or GT ICP. Protocol scope, GT tier, scene/instance unit type, and
+prediction-generation track are never merged into one score. See
+`reports/GT_CALIBRATION_V1_REPORT_zh.md` and
 `reports/GT_REPRESENTATIVE_GENRECON_V1_REPORT_zh.md` for source checksums,
 metrics, limitations, and reproduction commands.
 
@@ -264,9 +269,9 @@ EGL_PLATFORM=surfaceless .venv/bin/python \
 .venv/bin/python tools/validate_gt_calibration_videos.py
 ```
 
-The current review has six source/reference representatives, six actual
-GenRecon prediction renders, no missing-prediction panel, and one OmniObject3D
-authentication blocker. See
+The current review has seven prepared source/reference representatives, six
+registry-backed GenRecon prediction renders, one explicit OmniObject3D
+`missing-prediction` panel, and no source blocker. See
 `reports/GT_CALIBRATION_VIDEO_VISUALIZATION_V1_REPORT_zh.md` for the per-dataset
 selection, provenance boundaries, hashes, and validation counts.
 

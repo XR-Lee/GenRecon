@@ -70,6 +70,68 @@ class EvaluateGroundTruthSuiteTests(unittest.TestCase):
         self.assertAlmostEqual(result["metrics"]["normal_consistency"]["symmetric_mean"], 1.0)
         json.dumps(result, allow_nan=False)
 
+    def test_normalized_object_reference_suppresses_meter_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            prediction = root / "prediction.ply"
+            reference = root / "reference.ply"
+            manifest_path = root / "manifest.json"
+            _square(z=0.01).export(prediction)
+            _square().export(reference)
+            manifest = _manifest(
+                {
+                    "kind": "mesh",
+                    "paths": [reference.name],
+                    "scope": "normalized-object-global-reference",
+                    "coordinate_units": "normalized-object",
+                },
+                tier="O0-instance-scan",
+            )
+            manifest["evaluation"][
+                "primary_threshold_policy"
+            ] = "bbox-diagonal-normalized-only"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            result = evaluate_unit(
+                manifest_path,
+                prediction,
+                num_samples=8_192,
+                workers=1,
+            )
+
+        self.assertEqual(result["protocol"]["coordinate_units"], "normalized-object")
+        self.assertEqual(result["protocol"]["thresholds_m"], [])
+        self.assertEqual(result["metrics"]["coordinate_units"], "normalized-object")
+        self.assertNotIn("accuracy_m", result["metrics"])
+        self.assertNotIn("completeness_m", result["metrics"])
+        self.assertNotIn("chamfer_symmetric_mean_m", result["metrics"])
+        self.assertNotIn("ground_truth_bbox_diagonal_m", result["metrics"])
+        self.assertEqual(result["metrics"]["threshold_scores"], {})
+        self.assertIsNone(result["metrics"]["normal_consistency"])
+        self.assertEqual(result["backend"]["absolute_threshold_scores"], {})
+        backend_keys: list[str] = []
+
+        def collect_keys(value: object) -> None:
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    backend_keys.append(str(key))
+                    collect_keys(item)
+            elif isinstance(value, list):
+                for item in value:
+                    collect_keys(item)
+
+        collect_keys(result["backend"])
+        self.assertFalse([key for key in backend_keys if key.endswith("_m")])
+        self.assertGreater(
+            result["metrics"]["normalized_threshold_scores"]["0.010000"]
+            ["fscore_harmonic"],
+            0.0,
+        )
+        summary = summarize_results([result])
+        metrics = summary["tiers"]["O0-instance-scan"]["metrics"]
+        self.assertIn("chamfer_symmetric_mean_coordinate_units", metrics)
+        self.assertIn("fscore_at_bbox_1pct", metrics)
+        self.assertNotIn("chamfer_symmetric_mean_m", metrics)
+
     def test_pointcloud_reference_has_null_normal_score(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

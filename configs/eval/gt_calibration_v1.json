@@ -125,11 +125,35 @@
     "omniobject3d": {
       "track": "instance",
       "gt_tier": "O0-instance-scan",
-      "capture_kind": "real-object-video-and-scan",
+      "capture_kind": "scan-derived-rendered-object-multiview-and-real-object-scan",
       "source_url": "https://openxlab.org.cn/datasets/OpenXDLab/OmniObject3D-New/explore/main",
       "license_status": "CC-BY-4.0",
-      "access": "requires-openxlab-login-and-ak-sk",
-      "selection_status": "requested-semantic-slots-unresolved-until-authorized-metadata-is-available",
+      "access": "authorized-openxlab-ak-sk-local-only",
+      "selection_status": "official-object-ids-resolved-from-authorized-metadata",
+      "adapter": {
+        "adapter_version": 3,
+        "input_modality": "official-100-view-scan-derived-RGB-with-depth-EXR-mask-white-composite",
+        "camera_frame": "official-normalized-scan-render-frame",
+        "reference": "professional-scan-normalized-by-audited-full-render-scale-or-published-0.99-over-max-abs-recovery-and-Blender-OBJ-import-axis",
+        "pose_track": "GT-pose-scan-render",
+        "primary_threshold_policy": "bbox-diagonal-normalized-only",
+        "source_integrity_policy": "100-RGB-plus-100-normal-plus-100-depth-members-all-view-depth-mask-scan-projection-gate-visibility-aware-raycast-fallback-and-bounded-camera-SO3-repair",
+        "recorded_scale_recovery_policy": "only-if-recorded-scale-exceeds-published-render-target-by-more-than-10x-recompute-0.99-over-raw-max-abs",
+        "excluded_render_track": "24-view-GET3D-assets-are-not-used-for-scan-calibration",
+        "real_video_track_status": "separate-estimated-pose-track-not-yet-packaged"
+      },
+      "rejected_candidates": [
+        {
+          "object_id": "vase_002",
+          "reason": "official-full-render-and-raw-scan-pair-fails-depth-mask-alignment",
+          "first_failed_view": "r_0",
+          "recorded_scale": 0.009116672301299113,
+          "maximum_edge_error_px": 21.268085635747155,
+          "bbox_iou": 0.914795322353811,
+          "visibility_aware_mask_iou": 0.5814204815631349,
+          "replacement_object_id": "vase_004"
+        }
+      ],
       "unit_ids": [
         "apple_001",
         "apple_002",
@@ -154,7 +178,7 @@
         "teapot_001",
         "teapot_002",
         "vase_001",
-        "vase_002"
+        "vase_004"
       ]
     }
   },

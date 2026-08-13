@@ -92,6 +92,7 @@ nvidia-nvjitlink-cu12==12.6.85
 nvidia-nvtx-cu12==12.6.77
 o_voxel @ file:///home/campus.ncl.ac.uk/nxl51/genrecon/o-voxel
 open3d==0.19.0
+openexr==3.4.14
 opencv-python-headless==5.0.0.93
 orjson==3.11.9
 packaging==26.2

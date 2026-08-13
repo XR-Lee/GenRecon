@@ -59,9 +59,8 @@
       "dataset": "omniobject3d",
       "dataset_label": "OmniObject3D",
       "unit_id": "omniobject3d-bottle_045",
-      "scene_label": "requested bottle slot",
-      "selection_reason": "Authentication blocker representative; semantic slot is not an official object ID",
-      "expected_status": "blocked-auth"
+      "scene_label": "bottle_045",
+      "selection_reason": "Authorized official 100-view RGB/camera package with aligned professional scan reference; GenRecon prediction not yet run"
     }
   ]
 }

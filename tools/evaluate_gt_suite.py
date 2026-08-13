@@ -160,7 +160,64 @@ def _load_aligned_points(
     }
 
 
-def _canonical_mesh_metrics(raw: dict[str, Any]) -> dict[str, Any]:
+def _distance_values_without_meter_suffix(values: dict[str, Any]) -> dict[str, Any]:
+    return {key.removesuffix("_m"): value for key, value in values.items()}
+
+
+def _normalized_scores_for_coordinate_units(
+    scores: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    output = {}
+    for item in scores.values():
+        converted = dict(item)
+        threshold = converted.pop("threshold_m", None)
+        if threshold is not None:
+            converted["threshold_coordinate_units"] = threshold
+        key = f"{float(converted['bbox_diagonal_fraction']):.6f}"
+        output[key] = converted
+    return output
+
+
+def _normalized_object_backend(
+    raw: dict[str, Any], *, reference_kind: str
+) -> dict[str, Any]:
+    metrics = raw["metrics"]
+    reference_counts = raw.get("reference_counts")
+    if isinstance(reference_counts, dict):
+        reference_counts = dict(reference_counts)
+        bounds = reference_counts.pop("bounds_m", None)
+        if bounds is not None:
+            reference_counts["bounds_coordinate_units"] = bounds
+    return {
+        "schema": "genrecon.normalized-object-distance-backend",
+        "schema_version": 1,
+        "source_backend_schema": raw.get("schema"),
+        "reference_kind": reference_kind,
+        "coordinate_units": "normalized-object",
+        "absolute_threshold_scores": {},
+        "normal_consistency": None,
+        "reference_counts": reference_counts,
+        "metrics": {
+            "prediction_to_reference": _distance_values_without_meter_suffix(
+                metrics["pred_to_gt_m"]
+            ),
+            "reference_to_prediction": _distance_values_without_meter_suffix(
+                metrics["gt_to_pred_m"]
+            ),
+            "chamfer_symmetric_mean": metrics["chamfer_symmetric_mean_m"],
+            "ground_truth_bbox_diagonal": metrics[
+                "ground_truth_bbox_diagonal_m"
+            ],
+            "normalized_threshold_scores": _normalized_scores_for_coordinate_units(
+                metrics["normalized_threshold_scores"]
+            ),
+        },
+    }
+
+
+def _canonical_mesh_metrics(
+    raw: dict[str, Any], *, coordinate_units: str = "meters"
+) -> dict[str, Any]:
     metrics = raw["metrics"]
     threshold_scores = {
         f"{float(item['threshold_m']):.3f}": item
@@ -170,28 +227,45 @@ def _canonical_mesh_metrics(raw: dict[str, Any]) -> dict[str, Any]:
         f"{float(item['bbox_diagonal_fraction']):.6f}": item
         for item in metrics["normalized_threshold_scores"].values()
     }
+    if coordinate_units == "meters":
+        return {
+            "accuracy_m": metrics["pred_to_gt_m"],
+            "completeness_m": metrics["gt_to_pred_m"],
+            "chamfer_symmetric_mean_m": metrics["chamfer_symmetric_mean_m"],
+            "threshold_scores": threshold_scores,
+            "normalized_threshold_scores": normalized_scores,
+            "ground_truth_bbox_diagonal_m": metrics[
+                "ground_truth_bbox_diagonal_m"
+            ],
+            "normal_consistency": {
+                "prediction_to_gt": metrics["normal_consistency_pred_to_gt"],
+                "gt_to_prediction": metrics["normal_consistency_gt_to_pred"],
+                "symmetric_mean": metrics["normal_consistency_symmetric_mean"],
+                "prediction_correspondence_fraction": metrics[
+                    "normal_correspondence_fraction_pred_to_gt"
+                ],
+                "gt_correspondence_fraction": metrics[
+                    "normal_correspondence_fraction_gt_to_pred"
+                ],
+            },
+        }
     return {
-        "accuracy_m": metrics["pred_to_gt_m"],
-        "completeness_m": metrics["gt_to_pred_m"],
-        "chamfer_symmetric_mean_m": metrics["chamfer_symmetric_mean_m"],
-        "threshold_scores": threshold_scores,
-        "normalized_threshold_scores": normalized_scores,
-        "ground_truth_bbox_diagonal_m": metrics["ground_truth_bbox_diagonal_m"],
-        "normal_consistency": {
-            "prediction_to_gt": metrics["normal_consistency_pred_to_gt"],
-            "gt_to_prediction": metrics["normal_consistency_gt_to_pred"],
-            "symmetric_mean": metrics["normal_consistency_symmetric_mean"],
-            "prediction_correspondence_fraction": metrics[
-                "normal_correspondence_fraction_pred_to_gt"
-            ],
-            "gt_correspondence_fraction": metrics[
-                "normal_correspondence_fraction_gt_to_pred"
-            ],
-        },
+        "coordinate_units": coordinate_units,
+        "accuracy": _distance_values_without_meter_suffix(metrics["pred_to_gt_m"]),
+        "completeness": _distance_values_without_meter_suffix(metrics["gt_to_pred_m"]),
+        "chamfer_symmetric_mean": metrics["chamfer_symmetric_mean_m"],
+        "normalized_threshold_scores": _normalized_scores_for_coordinate_units(
+            normalized_scores
+        ),
+        "ground_truth_bbox_diagonal": metrics["ground_truth_bbox_diagonal_m"],
+        "normal_consistency": None,
+        "threshold_scores": {},
     }
 
 
-def _canonical_point_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
+def _canonical_point_metrics(
+    metrics: dict[str, Any], *, coordinate_units: str = "meters"
+) -> dict[str, Any]:
     def direction(values: dict[str, float]) -> dict[str, float]:
         return {
             "mean_m": values["mean"],
@@ -200,14 +274,29 @@ def _canonical_point_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
             "p95_m": values["p95"],
         }
 
+    accuracy = direction(metrics["pred_to_gt_m"])
+    completeness = direction(metrics["gt_to_pred_m"])
+    if coordinate_units == "meters":
+        return {
+            "accuracy_m": accuracy,
+            "completeness_m": completeness,
+            "chamfer_symmetric_mean_m": metrics["chamfer_symmetric_mean_m"],
+            "threshold_scores": metrics["threshold_scores"],
+            "normalized_threshold_scores": metrics["normalized_threshold_scores"],
+            "ground_truth_bbox_diagonal_m": metrics["ground_truth_bbox_diagonal_m"],
+            "normal_consistency": None,
+        }
     return {
-        "accuracy_m": direction(metrics["pred_to_gt_m"]),
-        "completeness_m": direction(metrics["gt_to_pred_m"]),
-        "chamfer_symmetric_mean_m": metrics["chamfer_symmetric_mean_m"],
-        "threshold_scores": metrics["threshold_scores"],
-        "normalized_threshold_scores": metrics["normalized_threshold_scores"],
-        "ground_truth_bbox_diagonal_m": metrics["ground_truth_bbox_diagonal_m"],
+        "coordinate_units": coordinate_units,
+        "accuracy": _distance_values_without_meter_suffix(accuracy),
+        "completeness": _distance_values_without_meter_suffix(completeness),
+        "chamfer_symmetric_mean": metrics["chamfer_symmetric_mean_m"],
+        "normalized_threshold_scores": _normalized_scores_for_coordinate_units(
+            metrics["normalized_threshold_scores"]
+        ),
+        "ground_truth_bbox_diagonal": metrics["ground_truth_bbox_diagonal_m"],
         "normal_consistency": None,
+        "threshold_scores": {},
     }
 
 
@@ -239,6 +328,11 @@ def evaluate_unit(
         raise GroundTruthSuiteError(f"Predicted mesh does not exist: {predicted_mesh}")
     base = manifest_path.parent
     reference = manifest["reference"]
+    coordinate_units = reference.get("coordinate_units", "meters")
+    if coordinate_units not in {"meters", "normalized-object"}:
+        raise GroundTruthSuiteError(
+            f"Unsupported reference coordinate units {coordinate_units!r}"
+        )
     reference_paths = [resolve_path(value, base) for value in reference["paths"]]
     missing = [str(path) for path in reference_paths if not path.is_file()]
     if missing:
@@ -246,6 +340,7 @@ def evaluate_unit(
 
     backend: dict[str, Any]
     reference_counts: dict[str, Any] | None = None
+    absolute_thresholds = thresholds_m if coordinate_units == "meters" else ()
     if reference["kind"] == "mesh":
         if len(reference_paths) != 1:
             raise GroundTruthSuiteError("Mesh reference requires exactly one path")
@@ -255,11 +350,17 @@ def evaluate_unit(
             num_samples=num_samples,
             seed=seed,
             gt_aabb_margin_m=reference.get("prediction_aabb_crop_margin_m"),
-            thresholds_m=thresholds_m,
+            thresholds_m=absolute_thresholds,
             normalized_thresholds=normalized_thresholds,
             workers=workers,
         )
-        metrics = _canonical_mesh_metrics(backend)
+        metrics = _canonical_mesh_metrics(
+            backend, coordinate_units=coordinate_units
+        )
+        if coordinate_units != "meters":
+            backend = _normalized_object_backend(
+                backend, reference_kind=reference["kind"]
+            )
     else:
         alignment_path = (
             resolve_path(reference["alignment_mlp"], base)
@@ -290,7 +391,7 @@ def evaluate_unit(
         point_metrics = distance_metrics(
             pred_points,
             gt_points,
-            thresholds_m=thresholds_m,
+            thresholds_m=absolute_thresholds,
             normalized_thresholds=normalized_thresholds,
             ground_truth_bounds=np.asarray(
                 reference_counts["bounds_m"], dtype=np.float64
@@ -302,7 +403,13 @@ def evaluate_unit(
             "reference_counts": reference_counts,
             "metrics": point_metrics,
         }
-        metrics = _canonical_point_metrics(point_metrics)
+        if coordinate_units != "meters":
+            backend = _normalized_object_backend(
+                backend, reference_kind=reference["kind"]
+            )
+        metrics = _canonical_point_metrics(
+            point_metrics, coordinate_units=coordinate_units
+        )
 
     result = {
         "schema": SCHEMA,
@@ -322,7 +429,11 @@ def evaluate_unit(
             "samples_per_prediction": int(num_samples),
             "max_reference_samples": int(max_gt_samples),
             "seed": int(seed),
-            "thresholds_m": [float(value) for value in thresholds_m],
+            "thresholds_m": (
+                [float(value) for value in thresholds_m]
+                if coordinate_units == "meters"
+                else []
+            ),
             "normalized_thresholds": [float(value) for value in normalized_thresholds],
         },
         "inputs": {
@@ -339,6 +450,15 @@ def evaluate_unit(
         "backend": backend,
         "limitations": list(manifest.get("evaluation", {}).get("limitations", [])),
     }
+    if coordinate_units != "meters":
+        result["protocol"].update(
+            {
+                "coordinate_units": coordinate_units,
+                "primary_threshold_policy": manifest.get("evaluation", {}).get(
+                    "primary_threshold_policy", "bbox-diagonal-normalized-only"
+                ),
+            }
+        )
     json.dumps(result, allow_nan=False)
     return result
 
@@ -458,6 +578,40 @@ def _summarize_homogeneous_results(
         "fscore_at_0.10m": ("metrics", "threshold_scores", "0.100", "fscore_harmonic"),
         "normal_consistency": ("metrics", "normal_consistency", "symmetric_mean"),
     }
+    normalized_only = any(
+        result.get("protocol", {}).get("coordinate_units") == "normalized-object"
+        for result in results
+    )
+    if normalized_only:
+        paths = {
+            "chamfer_symmetric_mean_coordinate_units": (
+                "metrics",
+                "chamfer_symmetric_mean",
+            ),
+            "fscore_at_bbox_0.5pct": (
+                "metrics",
+                "normalized_threshold_scores",
+                "0.005000",
+                "fscore_harmonic",
+            ),
+            "fscore_at_bbox_1pct": (
+                "metrics",
+                "normalized_threshold_scores",
+                "0.010000",
+                "fscore_harmonic",
+            ),
+            "fscore_at_bbox_2pct": (
+                "metrics",
+                "normalized_threshold_scores",
+                "0.020000",
+                "fscore_harmonic",
+            ),
+            "normal_consistency": (
+                "metrics",
+                "normal_consistency",
+                "symmetric_mean",
+            ),
+        }
     return {
         "result_count": len(results),
         "protocol_signature": protocol_signature,
@@ -487,6 +641,8 @@ def summarize_results(results: list[dict[str, Any]]) -> dict[str, Any]:
         "thresholds_m",
         "normalized_thresholds",
         "scope",
+        "coordinate_units",
+        "primary_threshold_policy",
     )
     signatures: dict[str, tuple[dict[str, Any], list[dict[str, Any]]]] = {}
     missing_protocol = []
@@ -494,7 +650,11 @@ def summarize_results(results: list[dict[str, Any]]) -> dict[str, Any]:
         if "protocol" not in result:
             missing_protocol.append(result)
             continue
-        signature = {key: result["protocol"].get(key) for key in protocol_fields}
+        signature = {
+            key: result["protocol"][key]
+            for key in protocol_fields
+            if key in result["protocol"]
+        }
         serialized = json.dumps(signature, sort_keys=True)
         signatures.setdefault(serialized, (signature, []))[1].append(result)
 
@@ -696,8 +856,43 @@ def summarize_output(output_root: Path) -> dict[str, Any]:
             raise GroundTruthSuiteError(
                 f"Reference scope changed since evaluation for {result['unit']['unit_id']}"
             )
+        current_coordinate_units = manifest["reference"].get(
+            "coordinate_units", "meters"
+        )
+        stored_coordinate_units = result["protocol"].get("coordinate_units")
+        if stored_coordinate_units is None:
+            if current_coordinate_units != "meters":
+                raise GroundTruthSuiteError(
+                    f"Coordinate units are missing from a non-meter evaluation for "
+                    f"{result['unit']['unit_id']}"
+                )
+        elif stored_coordinate_units != current_coordinate_units:
+            raise GroundTruthSuiteError(
+                f"Reference coordinate units changed since evaluation for "
+                f"{result['unit']['unit_id']}"
+            )
+        current_threshold_policy = manifest.get("evaluation", {}).get(
+            "primary_threshold_policy", "absolute-and-bbox-normalized"
+        )
+        stored_threshold_policy = result["protocol"].get(
+            "primary_threshold_policy"
+        )
+        if stored_threshold_policy is None:
+            if current_threshold_policy != "absolute-and-bbox-normalized":
+                raise GroundTruthSuiteError(
+                    f"Threshold policy is missing from a non-legacy evaluation for "
+                    f"{result['unit']['unit_id']}"
+                )
+        elif stored_threshold_policy != current_threshold_policy:
+            raise GroundTruthSuiteError(
+                f"Threshold policy changed since evaluation for "
+                f"{result['unit']['unit_id']}"
+            )
         result["inputs"]["manifest_sha256"] = sha256_file(manifest_path)
         result["protocol"]["scope"] = current_scope
+        if current_coordinate_units != "meters":
+            result["protocol"]["coordinate_units"] = current_coordinate_units
+            result["protocol"]["primary_threshold_policy"] = current_threshold_policy
         write_json(path, result)
         results.append(result)
     if not results:

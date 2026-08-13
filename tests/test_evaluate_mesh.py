@@ -114,6 +114,17 @@ class EvaluateMeshTests(unittest.TestCase):
         self.assertEqual(sorted(normalized), ["0.007071", "0.014142", "0.028284"])
         self.assertAlmostEqual(result["metrics"]["ground_truth_bbox_diagonal_m"], 2**0.5)
 
+    def test_empty_absolute_thresholds_are_allowed_for_normalized_protocols(self) -> None:
+        result = evaluate_meshes(
+            _unit_square(),
+            _unit_square(),
+            num_samples=128,
+            thresholds_m=(),
+            workers=1,
+        )
+        self.assertEqual(result["metrics"]["threshold_scores"], {})
+        self.assertTrue(result["metrics"]["normalized_threshold_scores"])
+
     def test_invalid_threshold_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "positive and finite"):
             evaluate_meshes(

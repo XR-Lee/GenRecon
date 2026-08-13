@@ -142,15 +142,15 @@ Official output SHA256：
 
 ## 7. 同相机视觉审查
 
-6 个可用代表场景均已有真实 prediction 第三栏。最终视频 release：
+6 个代表场景已有真实 prediction 第三栏；OmniObject3D `bottle_045` 作为第七个 prepared 代表展示真实 RGB/reference，并以显式状态卡占据第三栏。最终视频 release：
 
-- 7 datasets：6 available、1 blocked-auth；
-- 6/6 available datasets 有 prediction；
-- 96 frozen camera frames；
-- 26 H.264/yuv420p videos；
-- 496 decoded frames；
-- 53,315,310 video bytes；
-- reference coverage min/median/max：0.4111/0.8713/0.9988；
+- 7 datasets：7 available、0 blocked；
+- 6 个有 prediction，1 个 `missing-prediction`；
+- 112 frozen camera frames；
+- 29 H.264/yuv420p videos；
+- 560 decoded frames；
+- 54,100,208 video bytes；
+- reference coverage min/median/max：0.0460/0.8414/0.9988；
 - prediction coverage min/median/max：0.2746/0.7702/1.0000；
 - release validation：`pass`、`errors=[]`。
 
@@ -191,9 +191,9 @@ Render coverage、nonblank frame 和视觉同位只用于发现空帧、相机�
 - general asset summary CSV：`ff1086009ef695877eaa36c4040c9c7363178cfc18c3cf6f0a520d5abb47fe3b`；
 - general asset validation：`15fa6c14f9ef7a764653362bb410098b63020bbb261edf26de7eaaab81d4d3c1`；
 - inference validation：`53fc696342bb8be325b5f73a3bd3f5688985c50a7ac827a6f316c56bca061776`；
-- GT registry：`9d5592a913463ce23c38e638d48558f23f9d41600696ccad9ea6ef1bf6fc6cc0`；
-- evaluation index：`85fb5bb17410039f2c106d74f30735abbe71ce0799158b961cc3325da1a69e33`；
-- visualization release validation：`22b55528147d89c3417a159e370bbe7524aca917827193b0dbc8c1e5c6d99b1d`。
+- GT registry：`75e7f7e19dd8d305625ab9375d95a3c4ef70c36c652ed86849a9fba503079017`；
+- evaluation index：`81ba603bd41af7bee95c8b57c2548523a862e965731813f989bc45e595298fb5`；
+- visualization release validation：`ba4e6f2dd3b25c9abf45118d90c59be2986fe796f46ae73ec38e135e75722464`。
 
 专用 inference validator 写 `inference_validation.json`；通用 GenRecon validator 写 `validation.json`，二者职责分离，互不覆盖。通用 runner 的 deterministic `index.json` 与 `validation.json` 不写墙钟字段；连续两次真实四场景 validation 的 `index.json`、`summary.csv` 和 `validation.json` SHA256 均保持一致。
 
@@ -241,4 +241,4 @@ EGL_PLATFORM=surfaceless .venv/bin/python \
 7. Redwood 是 `P-C marginal` low-overlap case，不能将 conditional consistency 写成绝对几何精度。
 8. DTU 的背景平面 hallucination 是已确认视觉失败，不能由高 F-score、coverage 或 validator pass 覆盖。
 9. Observed/unobserved completion、full-GT-mask heldout RGB/depth、chunk boundary、trajectory 和 dedicated hallucination metrics 尚未实现，不能以当前空缺字段冒充已评测。
-10. 剩余 ETH3D 5、7-Scenes 6、Redwood 1、DTU 14，共 26 个 prepared units 仍无 prediction。
+10. 剩余 ETH3D 5、7-Scenes 6、Redwood 1、DTU 14、OmniObject3D 24，共 50 个 prepared units 仍无 prediction；Omni 还必须使用 normalized-object protocol，不能输出米制分数。

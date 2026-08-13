@@ -11,8 +11,10 @@ import json
 import os
 import re
 import shutil
+import tarfile
+import tempfile
 from collections import Counter
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 from zipfile import ZipFile
 
@@ -21,6 +23,11 @@ import numpy as np
 import py7zr
 import trimesh
 from PIL import Image
+
+try:
+    import OpenEXR
+except ModuleNotFoundError:
+    OpenEXR = None
 
 try:
     from tools.prepare_da3_scannetpp import (
@@ -44,9 +51,33 @@ PLAN_SCHEMA = "genrecon.gt-calibration-plan"
 _HASH_CACHE: dict[tuple[str, int, int], str] = {}
 SEVEN_INTRINSICS = {"fx": 585.0, "fy": 585.0, "cx": 320.0, "cy": 240.0, "width": 640, "height": 480}
 REDWOOD_INTRINSICS = {"fx": 525.0, "fy": 525.0, "cx": 319.5, "cy": 239.5, "width": 640, "height": 480}
+OMNI_DATASET_REPO = "OpenXDLab/OmniObject3D-New"
+OMNI_ADAPTER_VERSION = 3
+OMNI_OFFICIAL_CODE_REVISION = "d1e05fa62759089298c25bcccf83c94d718375c4"
+OMNI_SCAN_TO_RENDER_AXIS = np.asarray(
+    [[1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, -1.0, 0.0]],
+    dtype=np.float64,
+)
+OMNI_MAX_SILHOUETTE_EDGE_ERROR_PX = 8.0
+OMNI_MIN_SILHOUETTE_BBOX_IOU = 0.94
+OMNI_MIN_RAYCAST_MASK_IOU = 0.95
+OMNI_MAX_CAMERA_ORTHOGONALITY_FOR_REPAIR = 5e-4
+OMNI_MAX_CAMERA_ROTATION_REPAIR = 2e-4
+OMNI_RENDER_TARGET_MAX_ABS = 0.99
+OMNI_RECORDED_SCALE_MAX_TARGET_RATIO = 10.0
+OMNI_RENDER_RESOLUTION = 800
+OMNI_DEPTH_BACKGROUND_SENTINEL = float(np.finfo(np.float16).max)
 
 
 class CalibrationBuildError(RuntimeError):
+    pass
+
+
+class OmniAlignmentError(CalibrationBuildError):
+    pass
+
+
+class OmniDependencyError(CalibrationBuildError):
     pass
 
 
@@ -109,6 +140,466 @@ def safe_zip_names(archive: ZipFile) -> list[str]:
         if path.is_absolute() or ".." in path.parts:
             raise CalibrationBuildError(f"Unsafe ZIP path {name!r}")
     return names
+
+
+def safe_tar_members(archive: tarfile.TarFile) -> list[tarfile.TarInfo]:
+    members = archive.getmembers()
+    for member in members:
+        path = PurePosixPath(member.name)
+        if path.is_absolute() or ".." in path.parts:
+            raise CalibrationBuildError(f"Unsafe TAR path {member.name!r}")
+        if member.issym() or member.islnk() or member.isdev():
+            raise CalibrationBuildError(f"Unsupported TAR member {member.name!r}")
+    return members
+
+
+def farthest_point_indices(
+    points: np.ndarray,
+    requested: int,
+    *,
+    excluded: set[int] | None = None,
+) -> list[int]:
+    values = np.asarray(points, dtype=np.float64)
+    if values.ndim != 2 or values.shape[1] != 3 or not np.isfinite(values).all():
+        raise CalibrationBuildError("Farthest-point input must be finite [N,3] coordinates")
+    excluded = excluded or set()
+    eligible = np.asarray(
+        [index for index in range(len(values)) if index not in excluded],
+        dtype=np.int64,
+    )
+    if requested <= 0 or not len(eligible):
+        return []
+    requested = min(int(requested), len(eligible))
+    centered = values[eligible] - values[eligible].mean(axis=0)
+    first = int(eligible[int(np.argmax(np.sum(centered * centered, axis=1)))])
+    selected = [first]
+    minimum_distance = np.sum((values[eligible] - values[first]) ** 2, axis=1)
+    while len(selected) < requested:
+        minimum_distance[np.isin(eligible, selected)] = -np.inf
+        next_index = int(eligible[int(np.argmax(minimum_distance))])
+        selected.append(next_index)
+        distance = np.sum((values[eligible] - values[next_index]) ** 2, axis=1)
+        minimum_distance = np.minimum(minimum_distance, distance)
+    return selected
+
+
+def _sha256_bytes(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _canonical_json_sha256(document: Any) -> str:
+    payload = json.dumps(
+        document,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _normalized_tar_name(member: tarfile.TarInfo) -> str:
+    return member.name[2:] if member.name.startswith("./") else member.name
+
+
+def _unique_tar_member(
+    members: list[tarfile.TarInfo], expected_name: str, archive_path: Path
+) -> tarfile.TarInfo:
+    matches = [
+        member
+        for member in members
+        if member.isfile() and _normalized_tar_name(member) == expected_name
+    ]
+    if len(matches) != 1:
+        raise CalibrationBuildError(
+            f"Expected one {expected_name!r} in {archive_path}, found {len(matches)}"
+        )
+    return matches[0]
+
+
+def _read_tar_member(archive: tarfile.TarFile, member: tarfile.TarInfo) -> bytes:
+    handle = archive.extractfile(member)
+    if handle is None:
+        raise CalibrationBuildError(f"Unable to read TAR member {member.name!r}")
+    payload = handle.read()
+    if len(payload) != member.size:
+        raise CalibrationBuildError(f"Short read for TAR member {member.name!r}")
+    return payload
+
+
+def _read_tar_members_in_archive_order(
+    archive: tarfile.TarFile, members: Iterable[tarfile.TarInfo]
+) -> dict[str, bytes]:
+    output = {}
+    for member in sorted(members, key=lambda item: item.offset_data):
+        name = _normalized_tar_name(member)
+        if name in output:
+            raise CalibrationBuildError(f"Duplicate TAR member request {name!r}")
+        output[name] = _read_tar_member(archive, member)
+    return output
+
+
+def _omni_category(object_id: str) -> str:
+    match = re.fullmatch(r"(.+)_([0-9]{3})", object_id)
+    if not match:
+        raise CalibrationBuildError(f"Invalid OmniObject3D object ID {object_id!r}")
+    return match.group(1)
+
+
+def _omni_blender_c2w_to_opencv_with_audit(
+    value: Any,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    pose = np.asarray(value, dtype=np.float64)
+    if pose.shape != (4, 4) or not np.isfinite(pose).all():
+        raise CalibrationBuildError("Invalid OmniObject3D Blender camera pose")
+    if not np.allclose(pose[3], [0.0, 0.0, 0.0, 1.0], atol=1e-8):
+        raise CalibrationBuildError("Invalid OmniObject3D homogeneous camera row")
+    pose = pose.copy()
+    raw_rotation = pose[:3, :3].copy()
+    raw_determinant = float(np.linalg.det(raw_rotation))
+    raw_orthogonality_error = float(
+        np.max(np.abs(raw_rotation.T @ raw_rotation - np.eye(3)))
+    )
+    correction = np.zeros((3, 3), dtype=np.float64)
+    method = "unchanged-within-tolerance"
+    if raw_determinant <= 0.0:
+        raise CalibrationBuildError("OmniObject3D camera rotation is not right-handed")
+    if raw_orthogonality_error > 1e-5:
+        left, _, right = np.linalg.svd(raw_rotation)
+        repaired = left @ right
+        if np.linalg.det(repaired) < 0.0:
+            left[:, -1] *= -1.0
+            repaired = left @ right
+        correction = repaired - raw_rotation
+        if (
+            raw_orthogonality_error > OMNI_MAX_CAMERA_ORTHOGONALITY_FOR_REPAIR
+            or abs(raw_determinant - 1.0)
+            > OMNI_MAX_CAMERA_ORTHOGONALITY_FOR_REPAIR
+            or float(np.max(np.abs(correction)))
+            > OMNI_MAX_CAMERA_ROTATION_REPAIR
+        ):
+            raise CalibrationBuildError(
+                "OmniObject3D camera rotation exceeds bounded SO(3) repair limits"
+            )
+        pose[:3, :3] = repaired
+        method = "nearest-SO3-SVD"
+    pose[:3, 1:3] *= -1.0
+    rotation = pose[:3, :3]
+    if (
+        np.linalg.det(rotation) <= 0.0
+        or not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-5)
+    ):
+        raise CalibrationBuildError("OmniObject3D camera rotation is not SO(3)")
+    audit = {
+        "method": method,
+        "raw_determinant": raw_determinant,
+        "raw_orthogonality_max_abs": raw_orthogonality_error,
+        "max_abs_rotation_correction": float(np.max(np.abs(correction))),
+        "frobenius_rotation_correction": float(np.linalg.norm(correction)),
+    }
+    return pose, audit
+
+
+def _omni_blender_c2w_to_opencv(value: Any) -> np.ndarray:
+    pose, _ = _omni_blender_c2w_to_opencv_with_audit(value)
+    return pose
+
+
+def _omni_select_render_scale(
+    mesh: trimesh.Trimesh, recorded_scale: Any
+) -> tuple[float, dict[str, Any]]:
+    vertices = np.asarray(mesh.vertices, dtype=np.float64)
+    scale = float(recorded_scale)
+    if (
+        vertices.ndim != 2
+        or vertices.shape[1] != 3
+        or not len(vertices)
+        or not np.isfinite(vertices).all()
+        or not np.isfinite(scale)
+        or scale <= 0.0
+    ):
+        raise CalibrationBuildError("Invalid OmniObject3D render scale input")
+    source_radius = float(np.max(np.abs(vertices)))
+    recorded_output_radius = source_radius * scale
+    maximum_plausible_radius = (
+        OMNI_RENDER_TARGET_MAX_ABS * OMNI_RECORDED_SCALE_MAX_TARGET_RATIO
+    )
+    method = "recorded-full-render-scale"
+    selected_scale = scale
+    if recorded_output_radius > maximum_plausible_radius:
+        selected_scale = OMNI_RENDER_TARGET_MAX_ABS / source_radius
+        method = "recomputed-published-renderer-scale-after-recorded-scale-sanity-failure"
+    return selected_scale, {
+        "method": method,
+        "recorded_scale": scale,
+        "recorded_output_max_abs_coordinate": recorded_output_radius,
+        "recorded_scale_max_plausible_output_coordinate": maximum_plausible_radius,
+        "published_render_target_max_abs_coordinate": OMNI_RENDER_TARGET_MAX_ABS,
+        "selected_scale": selected_scale,
+        "selected_output_max_abs_coordinate": source_radius * selected_scale,
+        "recorded_scale_used": method == "recorded-full-render-scale",
+    }
+
+
+def _omni_scan_to_render_mesh(
+    mesh: trimesh.Trimesh, official_scale: Any
+) -> tuple[trimesh.Trimesh, dict[str, Any]]:
+    vertices = np.asarray(mesh.vertices, dtype=np.float64)
+    faces = np.asarray(mesh.faces)
+    scale = float(official_scale)
+    if (
+        vertices.ndim != 2
+        or vertices.shape[1] != 3
+        or not len(vertices)
+        or not np.isfinite(vertices).all()
+        or faces.ndim != 2
+        or faces.shape[1] != 3
+        or not len(faces)
+        or not np.isfinite(scale)
+        or scale <= 0.0
+    ):
+        raise CalibrationBuildError("Invalid OmniObject3D scan mesh or render scale")
+    transformed = vertices * scale @ OMNI_SCAN_TO_RENDER_AXIS
+    output = trimesh.Trimesh(
+        vertices=transformed,
+        faces=faces,
+        process=False,
+        maintain_order=True,
+    )
+    source_radius = float(np.max(np.abs(vertices)))
+    output_radius = float(np.max(np.abs(transformed)))
+    return output, {
+        "method": "audited-full-render-scale-and-Blender-OBJ-import-axis",
+        "source_max_abs_coordinate": source_radius,
+        "selected_uniform_scale": scale,
+        "output_max_abs_coordinate": output_radius,
+        "right_multiply_axis": OMNI_SCAN_TO_RENDER_AXIS.tolist(),
+        "source_bounds": np.stack((vertices.min(axis=0), vertices.max(axis=0))).tolist(),
+        "output_bounds": np.stack((transformed.min(axis=0), transformed.max(axis=0))).tolist(),
+        "coordinate_units": "normalized-object",
+    }
+
+
+def _load_omni_scan_mesh(payload: bytes) -> trimesh.Trimesh:
+    loaded = trimesh.load(io.BytesIO(payload), file_type="obj", process=False)
+    if isinstance(loaded, trimesh.Scene):
+        meshes = [
+            geometry
+            for geometry in loaded.dump(concatenate=False)
+            if isinstance(geometry, trimesh.Trimesh)
+        ]
+        if not meshes:
+            raise CalibrationBuildError("OmniObject3D OBJ contains no triangle mesh")
+        loaded = trimesh.util.concatenate(meshes)
+    if not isinstance(loaded, trimesh.Trimesh) or not len(loaded.faces):
+        raise CalibrationBuildError("OmniObject3D OBJ is not a nonempty triangle mesh")
+    loaded.merge_vertices(merge_tex=True, merge_norm=True)
+    return loaded
+
+
+def _omni_depth_mask(
+    depth_payload: bytes,
+) -> tuple[np.ndarray, tuple[int, int], list[int], dict[str, Any]]:
+    if OpenEXR is None:
+        raise OmniDependencyError(
+            "OpenEXR is required for OmniObject3D full-render depth masks; "
+            "install openexr==3.4.14"
+        )
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".exr") as temporary:
+            temporary.write(depth_payload)
+            temporary.flush()
+            channels = OpenEXR.File(temporary.name).channels()
+    except Exception as exc:
+        raise CalibrationBuildError(
+            f"Invalid OmniObject3D depth EXR: {exc}"
+        ) from exc
+    if len(channels) != 1:
+        raise CalibrationBuildError(
+            f"OmniObject3D depth EXR must contain one packed channel, got "
+            f"{sorted(channels)}"
+        )
+    channel_name, channel = next(iter(channels.items()))
+    packed = np.asarray(channel.pixels)
+    if (
+        packed.ndim != 3
+        or packed.shape[2] != 3
+        or packed.dtype.kind != "f"
+        or not np.isfinite(packed).all()
+        or not np.array_equal(packed[..., 0], packed[..., 1])
+        or not np.array_equal(packed[..., 0], packed[..., 2])
+    ):
+        raise CalibrationBuildError(
+            "OmniObject3D depth EXR is not a finite three-channel replicated depth pass"
+        )
+    depth = packed[..., 0]
+    if not np.any(depth == OMNI_DEPTH_BACKGROUND_SENTINEL):
+        raise CalibrationBuildError(
+            "OmniObject3D depth EXR is missing the official half-float background sentinel"
+        )
+    if np.any(depth > OMNI_DEPTH_BACKGROUND_SENTINEL):
+        raise CalibrationBuildError(
+            "OmniObject3D depth EXR exceeds the official half-float range"
+        )
+    background_sentinel = OMNI_DEPTH_BACKGROUND_SENTINEL
+    mask = depth < background_sentinel
+    rows, columns = np.nonzero(mask)
+    if (
+        not len(rows)
+        or np.all(mask)
+        or background_sentinel <= 0.0
+        or float(depth[mask].min()) <= 0.0
+    ):
+        raise CalibrationBuildError(
+            "OmniObject3D depth EXR has an invalid foreground/background split"
+        )
+    bbox = [
+        int(columns.min()),
+        int(rows.min()),
+        int(columns.max()),
+        int(rows.max()),
+    ]
+    metadata = {
+        "packed_channel": channel_name,
+        "dtype": str(packed.dtype),
+        "background_sentinel": background_sentinel,
+        "foreground_min_depth": float(depth[mask].min()),
+        "foreground_max_depth": float(depth[mask].max()),
+        "foreground_pixels": int(mask.sum()),
+    }
+    return mask, (packed.shape[1], packed.shape[0]), bbox, metadata
+
+
+def _omni_rgb_on_white(
+    rgb_payload: bytes, mask: np.ndarray, image_size: tuple[int, int]
+) -> bytes:
+    try:
+        with Image.open(io.BytesIO(rgb_payload)) as opened:
+            rgb = opened.convert("RGB")
+    except (OSError, ValueError) as exc:
+        raise CalibrationBuildError(
+            f"Invalid OmniObject3D RGB render: {exc}"
+        ) from exc
+    if rgb.size != image_size or mask.shape != (image_size[1], image_size[0]):
+        raise CalibrationBuildError("OmniObject3D RGB and depth dimensions differ")
+    rgb_array = np.asarray(rgb, dtype=np.uint8)
+    composited = np.full_like(rgb_array, 255)
+    composited[mask] = rgb_array[mask]
+    output = io.BytesIO()
+    Image.fromarray(composited, mode="RGB").save(
+        output, format="PNG", compress_level=3
+    )
+    return output.getvalue()
+
+
+def _omni_projection_bbox(
+    vertices: np.ndarray,
+    camera_to_world: np.ndarray,
+    intrinsic: np.ndarray,
+    image_size: tuple[int, int],
+) -> np.ndarray:
+    world_to_camera = np.linalg.inv(camera_to_world)
+    camera = vertices @ world_to_camera[:3, :3].T + world_to_camera[:3, 3]
+    valid = camera[:, 2] > 1e-8
+    camera = camera[valid]
+    if not len(camera):
+        raise CalibrationBuildError("OmniObject3D scan is behind a declared camera")
+    width, height = image_size
+    u = intrinsic[0, 0] * camera[:, 0] / camera[:, 2] + intrinsic[0, 2]
+    v = intrinsic[1, 1] * camera[:, 1] / camera[:, 2] + intrinsic[1, 2]
+    inside = (u >= 0.0) & (u < width) & (v >= 0.0) & (v < height)
+    if not np.any(inside):
+        raise CalibrationBuildError("OmniObject3D scan does not project into the image")
+    return np.asarray(
+        [u[inside].min(), v[inside].min(), u[inside].max(), v[inside].max()],
+        dtype=np.float64,
+    )
+
+
+def _omni_raycast_scene(mesh: trimesh.Trimesh) -> Any:
+    import open3d as o3d
+
+    vertices = np.asarray(mesh.vertices, dtype=np.float64)
+    faces = np.asarray(mesh.faces, dtype=np.int32)
+    legacy = o3d.geometry.TriangleMesh(
+        o3d.utility.Vector3dVector(vertices),
+        o3d.utility.Vector3iVector(faces),
+    )
+    scene = o3d.t.geometry.RaycastingScene()
+    scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(legacy))
+    return scene
+
+
+def _omni_raycast_mask(
+    scene: Any,
+    camera_to_world: np.ndarray,
+    intrinsic: np.ndarray,
+    image_size: tuple[int, int],
+) -> np.ndarray:
+    import open3d as o3d
+
+    width, height = image_size
+    world_to_camera = np.linalg.inv(camera_to_world)
+    rays = scene.create_rays_pinhole(
+        o3d.core.Tensor(intrinsic.astype(np.float32)),
+        o3d.core.Tensor(world_to_camera.astype(np.float32)),
+        width_px=width,
+        height_px=height,
+    )
+    mask = np.isfinite(scene.cast_rays(rays)["t_hit"].numpy())
+    if mask.shape != (height, width) or not np.any(mask):
+        raise CalibrationBuildError(
+            "OmniObject3D visibility-aware raycast produced an invalid mask"
+        )
+    return mask
+
+
+def _mask_bbox(mask: np.ndarray) -> np.ndarray:
+    rows, columns = np.nonzero(mask)
+    if not len(rows):
+        raise CalibrationBuildError("OmniObject3D mask has no foreground pixels")
+    return np.asarray(
+        [columns.min(), rows.min(), columns.max(), rows.max()], dtype=np.float64
+    )
+
+
+def _mask_iou(first: np.ndarray, second: np.ndarray) -> float:
+    if first.shape != second.shape or first.dtype != np.bool_ or second.dtype != np.bool_:
+        raise CalibrationBuildError("OmniObject3D masks are incompatible")
+    union = np.logical_or(first, second)
+    return float(np.logical_and(first, second).sum() / max(int(union.sum()), 1))
+
+
+def _bbox_iou(first: np.ndarray, second: np.ndarray) -> float:
+    minimum = np.maximum(first[:2], second[:2])
+    maximum = np.minimum(first[2:], second[2:])
+    intersection = float(np.prod(np.maximum(maximum - minimum, 0.0)))
+    first_area = float(np.prod(np.maximum(first[2:] - first[:2], 0.0)))
+    second_area = float(np.prod(np.maximum(second[2:] - second[:2], 0.0)))
+    return intersection / max(first_area + second_area - intersection, 1e-12)
+
+
+def _omni_intrinsic(camera_angle_x: float, image_size: tuple[int, int]) -> np.ndarray:
+    width, height = image_size
+    angle = float(camera_angle_x)
+    if not np.isfinite(angle) or not 0.0 < angle < np.pi:
+        raise CalibrationBuildError("Invalid OmniObject3D horizontal field of view")
+    focal = 0.5 * width / np.tan(0.5 * angle)
+    return np.asarray(
+        [[focal, 0.0, width / 2.0], [0.0, focal, height / 2.0], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+
+
+def _write_binary_mesh_ply(mesh: trimesh.Trimesh, destination: Path) -> None:
+    payload = trimesh.exchange.ply.export_ply(
+        mesh,
+        encoding="binary",
+        vertex_normal=False,
+        include_attributes=False,
+    )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(payload)
 
 
 def safe_7z_extract(path: Path, output: Path) -> None:
@@ -1398,22 +1889,639 @@ def prepare_tanks_and_temples(
     return [_write_manifest(output, manifest)]
 
 
-def prepare_omni_blockers(plan: dict[str, Any], output: Path) -> list[dict[str, Any]]:
+def _omni_blocked_manifest(
+    dataset: dict[str, Any],
+    output: Path,
+    object_id: str,
+    *,
+    status: str,
+    blocker: str,
+    source_records: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    unit_dir = output / "units" / f"omniobject3d-{object_id}"
+    if unit_dir.exists():
+        shutil.rmtree(unit_dir)
+    manifest = _base_manifest(
+        unit_id=f"omniobject3d-{object_id}",
+        dataset="omniobject3d",
+        track=dataset["track"],
+        gt_tier=dataset["gt_tier"],
+        capture_kind=dataset["capture_kind"],
+        license_status=dataset["license_status"],
+        status=status,
+    )
+    manifest["physical_scene_group"] = f"omniobject3d:{object_id}"
+    manifest.update(
+        {
+            "source": {
+                "object_id": object_id,
+                "category": _omni_category(object_id),
+                "url": dataset["source_url"],
+                "dataset_repo": OMNI_DATASET_REPO,
+                "adapter_version": OMNI_ADAPTER_VERSION,
+                "records": source_records or [],
+            },
+            "input": {
+                "conditioning_views": [],
+                "heldout_views": [],
+                "pose_source": "blocked",
+            },
+            "reference": {
+                "kind": "mesh",
+                "paths": [],
+                "roi": "full-object",
+                "scope": "normalized-object-global-reference",
+                "coordinate_units": "normalized-object",
+                "source_type": "professional-real-object-scan",
+            },
+            "evaluation": {
+                "alignment": status,
+                "pose_track": "GT-pose-scan-render",
+                "limitations": [blocker],
+            },
+            "prediction_mesh": None,
+            "blocker": blocker,
+        }
+    )
+    return _write_manifest(output, manifest)
+
+
+def _omni_archive_record(
+    index_by_path: dict[str, dict[str, Any]],
+    openxlab_path: str,
+    local_path: Path,
+) -> dict[str, Any]:
+    expected = index_by_path.get(openxlab_path)
+    if expected is None:
+        raise CalibrationBuildError(
+            f"OpenXLab file index is missing {openxlab_path}"
+        )
+    if (
+        not local_path.is_file()
+        or local_path.stat().st_size != expected.get("size")
+        or sha256_file(local_path) != expected.get("sha256")
+    ):
+        raise CalibrationBuildError(
+            f"OmniObject3D archive differs from OpenXLab index: {local_path}"
+        )
+    return {
+        "openxlab_path": openxlab_path,
+        "local_path": local_path,
+        "size_bytes": local_path.stat().st_size,
+        "sha256": expected["sha256"],
+    }
+
+
+def _prepare_omni_unit(
+    dataset: dict[str, Any],
+    output: Path,
+    object_id: str,
+    image_record: dict[str, Any],
+    scan_record: dict[str, Any],
+    file_index_path: Path,
+    *,
+    force: bool,
+) -> dict[str, Any]:
+    category = _omni_category(object_id)
+    unit_id = f"omniobject3d-{object_id}"
+    unit_dir = output / "units" / unit_id
+    if force and unit_dir.exists():
+        shutil.rmtree(unit_dir)
+    manifest_path = _manifest_path(output, unit_id)
+    image_archive_path = image_record["local_path"]
+    scan_archive_path = scan_record["local_path"]
+
+    with tarfile.open(image_archive_path, "r:gz") as image_archive, tarfile.open(
+        scan_archive_path, "r:gz"
+    ) as scan_archive:
+        image_members = safe_tar_members(image_archive)
+        scan_members = safe_tar_members(scan_archive)
+        transforms_member = _unique_tar_member(
+            image_members,
+            f"{object_id}/render/transforms.json",
+            image_archive_path,
+        )
+        scan_member = _unique_tar_member(
+            scan_members, f"{object_id}/Scan/Scan.obj", scan_archive_path
+        )
+        transforms_payload = _read_tar_member(image_archive, transforms_member)
+        scan_payload = _read_tar_member(scan_archive, scan_member)
+        try:
+            transforms = json.loads(transforms_payload)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise CalibrationBuildError(
+                f"Invalid OmniObject3D transforms for {object_id}: {exc}"
+            ) from exc
+        frames = transforms.get("frames")
+        if not isinstance(frames, list) or len(frames) != 100:
+            raise CalibrationBuildError(
+                f"OmniObject3D {object_id} must contain exactly 100 rendered views"
+            )
+        source_names = [str(frame.get("file_path", "")) for frame in frames]
+        expected_names = {f"r_{index}" for index in range(100)}
+        if len(source_names) != len(set(source_names)) or set(source_names) != expected_names:
+            raise CalibrationBuildError(
+                f"OmniObject3D {object_id} has an invalid 100-view filename set"
+            )
+        try:
+            official_scales = np.asarray(
+                [frame.get("scale") for frame in frames], dtype=np.float64
+            )
+        except (TypeError, ValueError) as exc:
+            raise CalibrationBuildError(
+                f"OmniObject3D {object_id} has an invalid official render scale"
+            ) from exc
+        if (
+            official_scales.shape != (100,)
+            or not np.isfinite(official_scales).all()
+            or np.any(official_scales <= 0.0)
+            or not np.allclose(
+                official_scales, official_scales[0], rtol=0.0, atol=1e-15
+            )
+        ):
+            raise CalibrationBuildError(
+                f"OmniObject3D {object_id} has inconsistent official render scales"
+            )
+        rgb_members = {}
+        normal_members = {}
+        depth_members = {}
+        for source_name in source_names:
+            rgb_members[source_name] = _unique_tar_member(
+                image_members,
+                f"{object_id}/render/images/{source_name}.png",
+                image_archive_path,
+            )
+            normal_members[source_name] = _unique_tar_member(
+                image_members,
+                f"{object_id}/render/normals/{source_name}_normal.png",
+                image_archive_path,
+            )
+            depth_members[source_name] = _unique_tar_member(
+                image_members,
+                f"{object_id}/render/depths/{source_name}_depth.exr",
+                image_archive_path,
+            )
+        if any(
+            member.size <= 0
+            for member in [
+                *rgb_members.values(),
+                *normal_members.values(),
+                *depth_members.values(),
+            ]
+        ):
+            raise CalibrationBuildError(
+                f"OmniObject3D {object_id} has an empty render member"
+            )
+
+        mesh = _load_omni_scan_mesh(scan_payload)
+        selected_scale, scale_selection = _omni_select_render_scale(
+            mesh, official_scales[0]
+        )
+        normalized_mesh, normalization = _omni_scan_to_render_mesh(
+            mesh, selected_scale
+        )
+        normalization["scale_selection"] = scale_selection
+        vertices = np.asarray(normalized_mesh.vertices, dtype=np.float64)
+        faces = np.asarray(normalized_mesh.faces)
+        pose_pairs = [
+            _omni_blender_c2w_to_opencv_with_audit(
+                frame.get("transform_matrix")
+            )
+            for frame in frames
+        ]
+        poses = [pair[0] for pair in pose_pairs]
+        pose_audits = [pair[1] for pair in pose_pairs]
+        centers = np.stack([pose[:3, 3] for pose in poses])
+        conditioning_indices = farthest_point_indices(centers, 8)
+        heldout_indices = farthest_point_indices(
+            centers, 8, excluded=set(conditioning_indices)
+        )
+        selected = {
+            "conditioning": conditioning_indices,
+            "heldout": heldout_indices,
+        }
+        selected_indices = set(conditioning_indices + heldout_indices)
+        selected_payloads = _read_tar_members_in_archive_order(
+            image_archive,
+            [
+                *depth_members.values(),
+                *(
+                    rgb_members[source_names[index]]
+                    for index in sorted(selected_indices)
+                ),
+            ],
+        )
+
+        image_metadata: dict[int, dict[str, Any]] = {}
+        alignment_views = []
+        raycast_scene = None
+        for source_index, (frame, pose) in enumerate(zip(frames, poses)):
+            source_name = str(frame["file_path"])
+            depth_member = depth_members[source_name]
+            depth_payload = selected_payloads[_normalized_tar_name(depth_member)]
+            depth_mask, image_size, depth_bbox, depth_metadata = _omni_depth_mask(
+                depth_payload
+            )
+            if image_size != (OMNI_RENDER_RESOLUTION, OMNI_RENDER_RESOLUTION):
+                raise CalibrationBuildError(
+                    f"OmniObject3D full render has unexpected dimensions {image_size}"
+                )
+            intrinsic = _omni_intrinsic(
+                float(transforms.get("camera_angle_x")), image_size
+            )
+            projected_bbox = _omni_projection_bbox(
+                vertices, pose, intrinsic, image_size
+            )
+            depth_bbox_array = np.asarray(depth_bbox, dtype=np.float64)
+            fast_edge_error = np.abs(projected_bbox - depth_bbox_array)
+            fast_bbox_iou = _bbox_iou(projected_bbox, depth_bbox_array)
+            fast_pass = bool(
+                float(fast_edge_error.max()) <= OMNI_MAX_SILHOUETTE_EDGE_ERROR_PX
+                and fast_bbox_iou >= OMNI_MIN_SILHOUETTE_BBOX_IOU
+            )
+            acceptance_method = "fast-projected-vertices"
+            accepted_bbox = projected_bbox
+            edge_error = fast_edge_error
+            bbox_iou = fast_bbox_iou
+            raycast_diagnostic = None
+            gate_pass = fast_pass
+            if not fast_pass:
+                if raycast_scene is None:
+                    raycast_scene = _omni_raycast_scene(normalized_mesh)
+                raycast_mask = _omni_raycast_mask(
+                    raycast_scene, pose, intrinsic, image_size
+                )
+                raycast_bbox = _mask_bbox(raycast_mask)
+                raycast_edge_error = np.abs(raycast_bbox - depth_bbox_array)
+                raycast_bbox_iou = _bbox_iou(raycast_bbox, depth_bbox_array)
+                raycast_mask_iou = _mask_iou(raycast_mask, depth_mask)
+                gate_pass = bool(
+                    float(raycast_edge_error.max())
+                    <= OMNI_MAX_SILHOUETTE_EDGE_ERROR_PX
+                    and raycast_bbox_iou >= OMNI_MIN_SILHOUETTE_BBOX_IOU
+                    and raycast_mask_iou >= OMNI_MIN_RAYCAST_MASK_IOU
+                )
+                acceptance_method = "visibility-aware-raycast-fallback"
+                accepted_bbox = raycast_bbox
+                edge_error = raycast_edge_error
+                bbox_iou = raycast_bbox_iou
+                raycast_diagnostic = {
+                    "raycast_bbox_xyxy": raycast_bbox.tolist(),
+                    "max_edge_error_px": float(raycast_edge_error.max()),
+                    "bbox_iou": raycast_bbox_iou,
+                    "mask_iou": raycast_mask_iou,
+                    "raycast_foreground_pixels": int(raycast_mask.sum()),
+                    "official_foreground_pixels": int(depth_mask.sum()),
+                    "pass": gate_pass,
+                }
+            diagnostic = {
+                "source_index": source_index,
+                "source_image": f"{source_name}.png",
+                "camera_pose_audit": pose_audits[source_index],
+                "depth_member": _normalized_tar_name(depth_member),
+                "depth_size_bytes": len(depth_payload),
+                "depth_sha256": _sha256_bytes(depth_payload),
+                "depth_mask_bbox_xyxy": depth_bbox,
+                "depth_mask": depth_metadata,
+                "fast_projection": {
+                    "projected_vertex_bbox_xyxy": projected_bbox.tolist(),
+                    "max_edge_error_px": float(fast_edge_error.max()),
+                    "bbox_iou": fast_bbox_iou,
+                    "pass": fast_pass,
+                },
+                "raycast_fallback": raycast_diagnostic,
+                "acceptance_method": acceptance_method,
+                "accepted_scan_bbox_xyxy": accepted_bbox.tolist(),
+                "max_edge_error_px": float(edge_error.max()),
+                "bbox_iou": bbox_iou,
+                "pass": gate_pass,
+            }
+            alignment_views.append(diagnostic)
+            if not gate_pass:
+                raise OmniAlignmentError(
+                    f"OmniObject3D scan/render alignment failed for "
+                    f"{object_id}/{source_name}: {diagnostic}"
+                )
+            if source_index in selected_indices:
+                rgb_member = rgb_members[source_name]
+                source_rgb_payload = selected_payloads[
+                    _normalized_tar_name(rgb_member)
+                ]
+                rgb_payload = _omni_rgb_on_white(
+                    source_rgb_payload, depth_mask, image_size
+                )
+                image_metadata[source_index] = {
+                    "rgb_payload": rgb_payload,
+                    "image_size": image_size,
+                    "intrinsic": intrinsic,
+                    "source_rgb_member": _normalized_tar_name(rgb_member),
+                    "source_rgb_sha256": _sha256_bytes(source_rgb_payload),
+                    "source_rgb_size_bytes": len(source_rgb_payload),
+                    "depth_member": _normalized_tar_name(depth_member),
+                    "depth_sha256": diagnostic["depth_sha256"],
+                    "depth_size_bytes": len(depth_payload),
+                    "depth_mask_bbox_xyxy": depth_bbox,
+                    "alignment": diagnostic,
+                }
+
+    reference_path = unit_dir / "reference" / "scan_normalized.ply"
+    _write_binary_mesh_ply(normalized_mesh, reference_path)
+    del mesh, normalized_mesh
+    camera_records: dict[str, list[dict[str, Any]]] = {
+        "conditioning": [],
+        "heldout": [],
+    }
+    conditioning_paths = []
+    heldout_paths = []
+    for role, indices in selected.items():
+        for order, source_index in enumerate(indices):
+            output_path = unit_dir / "rgb" / role / f"{order:03d}.png"
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes(image_metadata[source_index]["rgb_payload"])
+            relative_rgb = relpath(output_path, unit_dir)
+            record = {
+                "order": order,
+                "source_index": source_index,
+                "source_image": image_metadata[source_index]["source_rgb_member"],
+                "rgb": relative_rgb,
+                "camera_to_world": poses[source_index].tolist(),
+                "camera_pose_audit": pose_audits[source_index],
+                "intrinsics": image_metadata[source_index]["intrinsic"].tolist(),
+                "width": image_metadata[source_index]["image_size"][0],
+                "height": image_metadata[source_index]["image_size"][1],
+                "source_rgb_member": image_metadata[source_index][
+                    "source_rgb_member"
+                ],
+                "source_rgb_size_bytes": image_metadata[source_index][
+                    "source_rgb_size_bytes"
+                ],
+                "source_rgb_sha256": image_metadata[source_index][
+                    "source_rgb_sha256"
+                ],
+                "source_depth_member": image_metadata[source_index][
+                    "depth_member"
+                ],
+                "source_depth_size_bytes": image_metadata[source_index][
+                    "depth_size_bytes"
+                ],
+                "source_depth_sha256": image_metadata[source_index][
+                    "depth_sha256"
+                ],
+                "depth_mask_bbox_xyxy": image_metadata[source_index][
+                    "depth_mask_bbox_xyxy"
+                ],
+                "scan_projection_alignment": image_metadata[source_index]["alignment"],
+            }
+            camera_records[role].append(record)
+            manifest_relative = relpath(output_path, manifest_path.parent)
+            if role == "conditioning":
+                conditioning_paths.append(manifest_relative)
+            else:
+                heldout_paths.append(manifest_relative)
+
+    alignment_summary = {
+        "schema": "genrecon.omniobject3d-scan-render-alignment",
+        "schema_version": 3,
+        "unit_id": unit_id,
+        "method": "official raw scan transformed by an audited per-object scale selected from the full-render metadata or, only when that scale violates the published renderer target by more than 10x, recomputed from the published 0.99/max-abs formula; Blender OBJ import axis is then applied; all 100 official depth masks are first checked against projected vertex bounds, with visibility-aware Open3D raycasting required for any failed fast check",
+        "thresholds": {
+            "maximum_edge_error_px": OMNI_MAX_SILHOUETTE_EDGE_ERROR_PX,
+            "minimum_bbox_iou": OMNI_MIN_SILHOUETTE_BBOX_IOU,
+            "minimum_raycast_mask_iou": OMNI_MIN_RAYCAST_MASK_IOU,
+            "published_render_target_max_abs_coordinate": OMNI_RENDER_TARGET_MAX_ABS,
+            "recorded_scale_max_target_ratio": OMNI_RECORDED_SCALE_MAX_TARGET_RATIO,
+            "maximum_camera_orthogonality_for_repair": OMNI_MAX_CAMERA_ORTHOGONALITY_FOR_REPAIR,
+            "maximum_camera_rotation_repair": OMNI_MAX_CAMERA_ROTATION_REPAIR,
+        },
+        "view_count": len(alignment_views),
+        "fast_projection_pass_count": sum(
+            item["fast_projection"]["pass"] for item in alignment_views
+        ),
+        "raycast_fallback_count": sum(
+            item["raycast_fallback"] is not None for item in alignment_views
+        ),
+        "bounded_camera_repair_count": sum(
+            item["camera_pose_audit"]["method"] != "unchanged-within-tolerance"
+            for item in alignment_views
+        ),
+        "maximum_edge_error_px": max(
+            item["max_edge_error_px"] for item in alignment_views
+        ),
+        "minimum_bbox_iou": min(item["bbox_iou"] for item in alignment_views),
+        "views": alignment_views,
+        "result": "pass",
+    }
+    alignment_path = unit_dir / "scan_render_alignment.json"
+    write_json(alignment_path, alignment_summary)
+    camera_path = unit_dir / "cameras.json"
+    write_json(
+        camera_path,
+        {
+            "schema": "genrecon.gt-camera-split",
+            "schema_version": 1,
+            "pose_convention": "camera-to-world-opencv",
+            "source_pose_convention": "Blender camera-to-world with local Y/Z sign conversion",
+            "world_frame": "official normalized scan-render frame",
+            "coordinate_units": "normalized-object",
+            "conditioning": camera_records["conditioning"],
+            "heldout": camera_records["heldout"],
+        },
+    )
+
+    source_records = _write_source_records(
+        [file_index_path, image_archive_path, scan_archive_path]
+    )
+    source_members = {
+        "transforms": {
+            "archive": image_record["openxlab_path"],
+            "member": _normalized_tar_name(transforms_member),
+            "size_bytes": len(transforms_payload),
+            "sha256": _sha256_bytes(transforms_payload),
+            "canonical_json_sha256": _canonical_json_sha256(transforms),
+        },
+        "scan_obj": {
+            "archive": scan_record["openxlab_path"],
+            "member": _normalized_tar_name(scan_member),
+            "size_bytes": len(scan_payload),
+            "sha256": _sha256_bytes(scan_payload),
+        },
+    }
+    manifest = _base_manifest(
+        unit_id=unit_id,
+        dataset="omniobject3d",
+        track=dataset["track"],
+        gt_tier=dataset["gt_tier"],
+        capture_kind=dataset["capture_kind"],
+        license_status=dataset["license_status"],
+    )
+    manifest["physical_scene_group"] = f"omniobject3d:{object_id}"
+    manifest.update(
+        {
+            "source": {
+                "object_id": object_id,
+                "category": category,
+                "url": dataset["source_url"],
+                "dataset_repo": OMNI_DATASET_REPO,
+                "adapter_version": OMNI_ADAPTER_VERSION,
+                "official_code_revision": OMNI_OFFICIAL_CODE_REVISION,
+                "records": source_records,
+                "archive_members": source_members,
+            },
+            "input": {
+                "conditioning_views": conditioning_paths,
+                "heldout_views": heldout_paths,
+                "cameras": relpath(camera_path, manifest_path.parent),
+                "pose_source": "official-100-view-Blender-camera-to-world",
+                "split_policy": "deterministic-camera-center-FPS-8-conditioning-then-8-disjoint-heldout-from-100-official-views",
+                "background_policy": "source RGB composited over white with the matching official depth-EXR foreground mask; source foreground pixels unchanged",
+                "source_modality": "scan-derived-rendered-RGB",
+                "auxiliary_sources_not_conditioning": [
+                    "official depth EXRs used only for foreground masks and scan/render alignment audit; depth values are not exported",
+                    "official normal render members checked for source completeness but not read by GenRecon",
+                ],
+            },
+            "reference": {
+                "kind": "mesh",
+                "paths": [relpath(reference_path, manifest_path.parent)],
+                "roi": "full-object",
+                "scope": "normalized-object-global-reference",
+                "coordinate_units": "normalized-object",
+                "source_type": "professional-real-object-scan-normalized-to-official-render-frame",
+                "normalization": normalization,
+                "stats": {
+                    "vertices": int(len(vertices)),
+                    "faces": int(len(faces)),
+                    "bounds": normalization["output_bounds"],
+                },
+                "scan_render_alignment": relpath(
+                    alignment_path, manifest_path.parent
+                ),
+            },
+            "evaluation": {
+                "alignment": "provided-official-normalized-scan-render-frame",
+                "pose_track": "GT-pose-scan-render",
+                "primary_threshold_policy": "bbox-diagonal-normalized-only",
+                "limitations": [
+                    "Conditioning and heldout RGB are rendered from the same reference scan; neither split is geometry-independent.",
+                    "This is the official 100-view normalized surface-reconstruction calibration domain, not the 24-view GET3D or real iPhone video domains.",
+                    "Coordinates are normalized object units, not meters; absolute 2/5/10 cm scores are not valid for this unit.",
+                    "The reference scan is evaluation-only and must not be read by GenRecon conditioning or alignment.",
+                ],
+            },
+            "prediction_mesh": None,
+            "blocker": None,
+        }
+    )
+    return _write_manifest(output, manifest)
+
+
+def prepare_omniobject3d(
+    plan: dict[str, Any], output: Path, source_root: Path, *, force: bool
+) -> list[dict[str, Any]]:
     dataset = plan["datasets"]["omniobject3d"]
+    expected_unit_directories = {
+        f"omniobject3d-{object_id}" for object_id in dataset["unit_ids"]
+    }
+    if force:
+        for path in sorted((output / "units").glob("omniobject3d-*")):
+            if path.is_dir() and path.name not in expected_unit_directories:
+                shutil.rmtree(path)
+    source = source_root / "omniobject3d"
+    file_index_path = source / "metadata" / "openxlab_file_index.json"
+    download_root = (
+        source
+        / "downloads"
+        / "OpenXDLab___OmniObject3D-New"
+    )
+    if not file_index_path.is_file():
+        blocker = (
+            "OpenXLab metadata index is unavailable; authenticate locally and fetch "
+            "the official file listing without committing AK/SK credentials."
+        )
+        return [
+            _omni_blocked_manifest(
+                dataset,
+                output,
+                object_id,
+                status="blocked-auth",
+                blocker=blocker,
+            )
+            for object_id in dataset["unit_ids"]
+        ]
+    file_index = load_json(file_index_path)
+    if (
+        file_index.get("schema") != "genrecon.omniobject3d-openxlab-file-index"
+        or file_index.get("dataset_repo") != OMNI_DATASET_REPO
+        or not isinstance(file_index.get("files"), list)
+    ):
+        raise CalibrationBuildError(
+            f"Unexpected OmniObject3D OpenXLab index: {file_index_path}"
+        )
+    index_by_path = {item["path"]: item for item in file_index["files"]}
     rows = []
     for object_id in dataset["unit_ids"]:
-        manifest = _base_manifest(unit_id=f"omniobject3d-{object_id}", dataset="omniobject3d", track=dataset["track"], gt_tier=dataset["gt_tier"], capture_kind=dataset["capture_kind"], license_status=dataset["license_status"], status="blocked-auth")
-        manifest.update(
-            {
-                "source": {"object_id": object_id, "url": dataset["source_url"], "records": []},
-                "input": {"conditioning_views": [], "heldout_views": [], "pose_source": "blocked"},
-                "reference": {"kind": "mesh", "paths": [], "roi": "full-object", "source_type": "professional-real-object-scan"},
-                "evaluation": {"alignment": "canonical-object-frame-pending", "limitations": ["Official source requires an approved OpenXLab account and AK/SK credentials."]},
-                "prediction_mesh": None,
-                "blocker": "OpenXLab login and AK/SK are unavailable; access was not bypassed.",
-            }
+        category = _omni_category(object_id)
+        image_openxlab_path = f"/raw/blender_renders/{category}.tar.gz"
+        scan_openxlab_path = f"/raw/raw_scans/{category}.tar.gz"
+        image_path = download_root / image_openxlab_path.removeprefix("/")
+        scan_path = download_root / scan_openxlab_path.removeprefix("/")
+        missing = [
+            str(path)
+            for path in (image_path, scan_path)
+            if not path.is_file()
+        ]
+        if missing:
+            rows.append(
+                _omni_blocked_manifest(
+                    dataset,
+                    output,
+                    object_id,
+                    status="missing-local-source",
+                    blocker=f"Authorized OmniObject3D archives are not downloaded: {missing}",
+                    source_records=_write_source_records([file_index_path]),
+                )
+            )
+            continue
+        image_record = _omni_archive_record(
+            index_by_path, image_openxlab_path, image_path
         )
-        rows.append(_write_manifest(output, manifest))
+        scan_record = _omni_archive_record(
+            index_by_path, scan_openxlab_path, scan_path
+        )
+        source_records = _write_source_records(
+            [file_index_path, image_path, scan_path]
+        )
+        try:
+            row = _prepare_omni_unit(
+                dataset,
+                output,
+                object_id,
+                image_record,
+                scan_record,
+                file_index_path,
+                force=force,
+            )
+        except OmniAlignmentError as exc:
+            row = _omni_blocked_manifest(
+                dataset,
+                output,
+                object_id,
+                status="alignment-failed",
+                blocker=str(exc),
+                source_records=source_records,
+            )
+        except OmniDependencyError:
+            raise
+        except (CalibrationBuildError, OSError, tarfile.TarError) as exc:
+            row = _omni_blocked_manifest(
+                dataset,
+                output,
+                object_id,
+                status="source-incomplete",
+                blocker=f"{type(exc).__name__}: {exc}",
+                source_records=source_records,
+            )
+        rows.append(row)
     return rows
 
 
@@ -1761,6 +2869,258 @@ def _strict_json_files(output: Path) -> tuple[int, list[str]]:
     return count, errors
 
 
+def _validate_omni_prepared_package(
+    manifest: dict[str, Any], manifest_path: Path, camera_split: dict[str, Any] | None
+) -> None:
+    unit_id = manifest["unit_id"]
+    object_id = manifest.get("source", {}).get("object_id")
+    if (
+        manifest.get("dataset") != "omniobject3d"
+        or manifest.get("status") != "prepared"
+        or not isinstance(object_id, str)
+        or unit_id != f"omniobject3d-{object_id}"
+        or manifest.get("source", {}).get("adapter_version")
+        != OMNI_ADAPTER_VERSION
+        or manifest.get("source", {}).get("dataset_repo") != OMNI_DATASET_REPO
+        or manifest.get("source", {}).get("official_code_revision")
+        != OMNI_OFFICIAL_CODE_REVISION
+    ):
+        raise CalibrationBuildError("unexpected OmniObject3D package identity")
+
+    unit_dir = manifest_path.parent
+    input_document = manifest.get("input", {})
+    conditioning = input_document.get("conditioning_views")
+    heldout = input_document.get("heldout_views")
+    if (
+        not isinstance(conditioning, list)
+        or not isinstance(heldout, list)
+        or len(conditioning) != 8
+        or len(heldout) != 8
+        or len(set(conditioning + heldout)) != 16
+        or input_document.get("pose_source")
+        != "official-100-view-Blender-camera-to-world"
+        or input_document.get("source_modality") != "scan-derived-rendered-RGB"
+        or input_document.get("conditioning_depths") not in (None, [])
+        or input_document.get("heldout_depths") not in (None, [])
+        or list(unit_dir.rglob("*.exr"))
+        or (unit_dir / "depth").exists()
+    ):
+        raise CalibrationBuildError("OmniObject3D input is not RGB-only 8+8")
+
+    if (
+        not isinstance(camera_split, dict)
+        or camera_split.get("schema") != "genrecon.gt-camera-split"
+        or camera_split.get("pose_convention") != "camera-to-world-opencv"
+        or camera_split.get("coordinate_units") != "normalized-object"
+    ):
+        raise CalibrationBuildError("invalid OmniObject3D camera split schema")
+
+    alignment_value = manifest.get("reference", {}).get("scan_render_alignment")
+    if not isinstance(alignment_value, str):
+        raise CalibrationBuildError("missing OmniObject3D alignment artifact")
+    alignment_path = (unit_dir / alignment_value).resolve()
+    alignment = load_json(alignment_path)
+    thresholds = alignment.get("thresholds", {})
+    expected_thresholds = {
+        "maximum_edge_error_px": OMNI_MAX_SILHOUETTE_EDGE_ERROR_PX,
+        "minimum_bbox_iou": OMNI_MIN_SILHOUETTE_BBOX_IOU,
+        "minimum_raycast_mask_iou": OMNI_MIN_RAYCAST_MASK_IOU,
+        "maximum_camera_orthogonality_for_repair": OMNI_MAX_CAMERA_ORTHOGONALITY_FOR_REPAIR,
+        "maximum_camera_rotation_repair": OMNI_MAX_CAMERA_ROTATION_REPAIR,
+        "published_render_target_max_abs_coordinate": OMNI_RENDER_TARGET_MAX_ABS,
+        "recorded_scale_max_target_ratio": OMNI_RECORDED_SCALE_MAX_TARGET_RATIO,
+    }
+    views = alignment.get("views")
+    if (
+        alignment.get("schema")
+        != "genrecon.omniobject3d-scan-render-alignment"
+        or alignment.get("schema_version") != 3
+        or alignment.get("unit_id") != unit_id
+        or alignment.get("result") != "pass"
+        or thresholds != expected_thresholds
+        or not isinstance(views, list)
+        or len(views) != 100
+        or [view.get("source_index") for view in views] != list(range(100))
+    ):
+        raise CalibrationBuildError("invalid OmniObject3D 100-view alignment schema")
+
+    fast_count = 0
+    fallback_count = 0
+    repair_count = 0
+    for view in views:
+        source_index = view["source_index"]
+        fast = view.get("fast_projection")
+        fallback = view.get("raycast_fallback")
+        pose_audit = view.get("camera_pose_audit")
+        if (
+            view.get("pass") is not True
+            or not isinstance(fast, dict)
+            or not isinstance(pose_audit, dict)
+            or view.get("source_image") != f"r_{source_index}.png"
+            or view.get("depth_member")
+            != f"{object_id}/render/depths/r_{source_index}_depth.exr"
+            or not _sha256_string(view.get("depth_sha256"))
+            or not isinstance(view.get("depth_size_bytes"), int)
+            or view["depth_size_bytes"] <= 0
+            or view.get("depth_mask", {}).get("background_sentinel")
+            != OMNI_DEPTH_BACKGROUND_SENTINEL
+            or view.get("depth_mask", {}).get("packed_channel") != "RGB"
+            or view.get("depth_mask", {}).get("dtype") != "float32"
+        ):
+            raise CalibrationBuildError("invalid OmniObject3D view provenance")
+        if fast.get("pass") is True:
+            fast_count += 1
+            if (
+                fallback is not None
+                or view.get("acceptance_method") != "fast-projected-vertices"
+                or fast.get("max_edge_error_px")
+                > OMNI_MAX_SILHOUETTE_EDGE_ERROR_PX
+                or fast.get("bbox_iou") < OMNI_MIN_SILHOUETTE_BBOX_IOU
+            ):
+                raise CalibrationBuildError("invalid OmniObject3D fast acceptance")
+        else:
+            fallback_count += 1
+            if (
+                not isinstance(fallback, dict)
+                or fallback.get("pass") is not True
+                or view.get("acceptance_method")
+                != "visibility-aware-raycast-fallback"
+                or fallback.get("max_edge_error_px")
+                > OMNI_MAX_SILHOUETTE_EDGE_ERROR_PX
+                or fallback.get("bbox_iou") < OMNI_MIN_SILHOUETTE_BBOX_IOU
+                or fallback.get("mask_iou") < OMNI_MIN_RAYCAST_MASK_IOU
+            ):
+                raise CalibrationBuildError("invalid OmniObject3D raycast acceptance")
+        if pose_audit.get("method") == "nearest-SO3-SVD":
+            repair_count += 1
+            if (
+                pose_audit.get("raw_orthogonality_max_abs") <= 1e-5
+                or pose_audit.get("raw_orthogonality_max_abs")
+                > OMNI_MAX_CAMERA_ORTHOGONALITY_FOR_REPAIR
+                or pose_audit.get("max_abs_rotation_correction")
+                > OMNI_MAX_CAMERA_ROTATION_REPAIR
+            ):
+                raise CalibrationBuildError("invalid OmniObject3D camera repair")
+        elif (
+            pose_audit.get("method") != "unchanged-within-tolerance"
+            or pose_audit.get("max_abs_rotation_correction") != 0.0
+        ):
+            raise CalibrationBuildError("invalid OmniObject3D camera pose audit")
+
+    if (
+        alignment.get("view_count") != 100
+        or alignment.get("fast_projection_pass_count") != fast_count
+        or alignment.get("raycast_fallback_count") != fallback_count
+        or alignment.get("bounded_camera_repair_count") != repair_count
+        or not np.isclose(
+            alignment.get("maximum_edge_error_px"),
+            max(view["max_edge_error_px"] for view in views),
+            rtol=0.0,
+            atol=1e-12,
+        )
+        or not np.isclose(
+            alignment.get("minimum_bbox_iou"),
+            min(view["bbox_iou"] for view in views),
+            rtol=0.0,
+            atol=1e-12,
+        )
+    ):
+        raise CalibrationBuildError("OmniObject3D alignment summary is stale")
+
+    normalization = manifest.get("reference", {}).get("normalization", {})
+    scale_selection = normalization.get("scale_selection", {})
+    source_radius = float(normalization.get("source_max_abs_coordinate", np.nan))
+    selected_scale = float(normalization.get("selected_uniform_scale", np.nan))
+    recorded_scale = float(scale_selection.get("recorded_scale", np.nan))
+    recorded_output_radius = source_radius * recorded_scale
+    expected_recovery = recorded_output_radius > (
+        OMNI_RENDER_TARGET_MAX_ABS * OMNI_RECORDED_SCALE_MAX_TARGET_RATIO
+    )
+    expected_scale = (
+        OMNI_RENDER_TARGET_MAX_ABS / source_radius
+        if expected_recovery
+        else recorded_scale
+    )
+    expected_scale_method = (
+        "recomputed-published-renderer-scale-after-recorded-scale-sanity-failure"
+        if expected_recovery
+        else "recorded-full-render-scale"
+    )
+    if (
+        normalization.get("method")
+        != "audited-full-render-scale-and-Blender-OBJ-import-axis"
+        or normalization.get("coordinate_units") != "normalized-object"
+        or not np.array_equal(
+            np.asarray(normalization.get("right_multiply_axis")),
+            OMNI_SCAN_TO_RENDER_AXIS,
+        )
+        or not np.isfinite([source_radius, selected_scale, recorded_scale]).all()
+        or source_radius <= 0.0
+        or selected_scale <= 0.0
+        or scale_selection.get("method") != expected_scale_method
+        or scale_selection.get("recorded_scale_used") is expected_recovery
+        or not np.isclose(selected_scale, expected_scale, rtol=0.0, atol=1e-15)
+        or not np.isclose(
+            scale_selection.get("recorded_output_max_abs_coordinate"),
+            recorded_output_radius,
+            rtol=0.0,
+            atol=1e-9,
+        )
+        or not np.isclose(
+            normalization.get("output_max_abs_coordinate"),
+            source_radius * selected_scale,
+            rtol=0.0,
+            atol=1e-9,
+        )
+    ):
+        raise CalibrationBuildError("invalid OmniObject3D scale selection")
+
+    by_index = {view["source_index"]: view for view in views}
+    selected_indices = []
+    for role, expected_paths in (("conditioning", conditioning), ("heldout", heldout)):
+        records = camera_split.get(role)
+        if not isinstance(records, list) or len(records) != 8:
+            raise CalibrationBuildError("invalid OmniObject3D camera role count")
+        for order, (record, expected_path) in enumerate(zip(records, expected_paths)):
+            source_index = record.get("source_index")
+            expected_rgb = f"rgb/{role}/{order:03d}.png"
+            selected_indices.append(source_index)
+            pose = np.asarray(record.get("camera_to_world"), dtype=np.float64)
+            intrinsic = np.asarray(record.get("intrinsics"), dtype=np.float64)
+            if (
+                record.get("order") != order
+                or expected_path != expected_rgb
+                or record.get("rgb") != expected_rgb
+                or not isinstance(source_index, int)
+                or source_index not in by_index
+                or record.get("source_rgb_member")
+                != f"{object_id}/render/images/r_{source_index}.png"
+                or record.get("source_depth_member")
+                != f"{object_id}/render/depths/r_{source_index}_depth.exr"
+                or not _sha256_string(record.get("source_rgb_sha256"))
+                or not _sha256_string(record.get("source_depth_sha256"))
+                or record.get("source_depth_sha256")
+                != by_index[source_index]["depth_sha256"]
+                or record.get("scan_projection_alignment") != by_index[source_index]
+                or record.get("camera_pose_audit")
+                != by_index[source_index]["camera_pose_audit"]
+                or pose.shape != (4, 4)
+                or intrinsic.shape != (3, 3)
+                or not np.isfinite(pose).all()
+                or not np.isfinite(intrinsic).all()
+                or not np.allclose(pose[3], [0.0, 0.0, 0.0, 1.0], atol=1e-9)
+                or not np.allclose(
+                    pose[:3, :3].T @ pose[:3, :3], np.eye(3), atol=1e-5
+                )
+                or np.linalg.det(pose[:3, :3]) <= 0.0
+                or record.get("width") != OMNI_RENDER_RESOLUTION
+                or record.get("height") != OMNI_RENDER_RESOLUTION
+            ):
+                raise CalibrationBuildError("invalid OmniObject3D selected camera")
+    if len(set(selected_indices)) != 16:
+        raise CalibrationBuildError("OmniObject3D selected camera indices overlap")
+
+
 def validate(output: Path, plan: dict[str, Any]) -> dict[str, Any]:
     registry = load_json(output / "registry.json")
     expected = sum(len(dataset["unit_ids"]) for dataset in plan["datasets"].values())
@@ -1808,6 +3168,7 @@ def validate(output: Path, plan: dict[str, Any]) -> dict[str, Any]:
     decoded_depths = 0
     prediction_files = 0
     prediction_bytes = 0
+    omni_prepared_packages = 0
     for row in registry.get("units", []):
         if row["unit_id"] in seen:
             errors.append(f"duplicate unit {row['unit_id']}")
@@ -1936,6 +3297,17 @@ def validate(output: Path, plan: dict[str, Any]) -> dict[str, Any]:
                         raise CalibrationBuildError("camera split count does not match input views")
                 except Exception as exc:
                     errors.append(f"invalid camera split for {row['unit_id']}: {camera_path}: {exc}")
+            if manifest["dataset"] == "omniobject3d":
+                try:
+                    _validate_omni_prepared_package(
+                        manifest, manifest_path, camera_split
+                    )
+                    omni_prepared_packages += 1
+                except Exception as exc:
+                    errors.append(
+                        f"invalid OmniObject3D package contract for "
+                        f"{row['unit_id']}: {exc}"
+                    )
             if manifest["dataset"] == "tanks-and-temples-training":
                 try:
                     if manifest["reference"].get("scope") != "official-crop-global-reference":
@@ -2034,6 +3406,7 @@ def validate(output: Path, plan: dict[str, Any]) -> dict[str, Any]:
         "decoded_depths": decoded_depths,
         "prediction_files": prediction_files,
         "prediction_bytes": prediction_bytes,
+        "omni_prepared_packages": omni_prepared_packages,
         "strict_json_files": strict_json,
     }
     result = {
@@ -2041,7 +3414,9 @@ def validate(output: Path, plan: dict[str, Any]) -> dict[str, Any]:
         "schema_version": 1,
         "result": "pass" if not errors else "fail",
         "counts": counts,
-        "declared_blockers": [row for row in registry.get("units", []) if row["status"].startswith("blocked") or row["status"] == "source-prepared-unposed"],
+        "declared_blockers": [
+            row for row in registry.get("units", []) if row["status"] != "prepared"
+        ],
         "errors": errors,
     }
     write_json(output / "validation.json", result)
@@ -2093,7 +3468,11 @@ def main() -> int:
                 )
             )
         if "omniobject3d" in selected:
-            rows.extend(prepare_omni_blockers(plan, output))
+            rows.extend(
+                prepare_omniobject3d(
+                    plan, output, source_root, force=args.force
+                )
+            )
         if selected != set(plan["datasets"]):
             existing = load_json(output / "registry.json")["units"] if (output / "registry.json").is_file() else []
             replaced = {row["dataset"] for row in rows}

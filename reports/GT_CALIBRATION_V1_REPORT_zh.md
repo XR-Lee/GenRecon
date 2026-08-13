@@ -2,16 +2,15 @@
 
 ## 1. 结论
 
-本轮将此前规划的 room-scale 与 instance-scale 校准集冻结为 76 个可审计单元，并完成公开、可无认证下载部分的构建、26 个 prediction 的统一评测，以及 6 个代表场景的同相机视频审查。
+本轮将此前规划的 room-scale 与 instance-scale 校准集冻结为 76 个可审计单元，并完成全部单元的数据构建、26 个 prediction 的统一评测，以及 7 个数据集代表的同相机视频审查。
 
-- 冻结总数：76 单元。
-- 完整 calibration package：52 单元。
-- 官方认证阻塞：OmniObject3D 24 个请求槽位。
+- 冻结总数：76 单元，76/76 calibration packages 为 `prepared`，无 source blocker。
 - 已有 prediction 并完成统一评测：26 个；其中 22 个是历史 G0 prediction，4 个是本轮新增的 RGB-only representative prediction。
-- 新增本地数据：约 42 GiB，其中 source archives 约 41 GiB、冻结 unit packages 约 1.6 GiB；T&T fixed-pose calibration work cache 约 867 MiB。
-- 构建验证、source archive 深验证、representative inference validation 和视频 release validation 均为 `pass`、`errors=[]`。
+- 尚无 prediction：50 个 prepared 单元，其中包括全部 24 个 OmniObject3D 单元。
+- OmniObject3D 已从 OpenXLab 官方 metadata 解析真实 object IDs，并以 adapter v3 构建 24 个 100-view render/raw-scan packages；坐标固定为 `normalized-object`。
+- 深 source validation 覆盖 71 个 archives/videos、80,772,051,894 bytes；构建验证、representative inference validation 和视频 release validation 均为 `pass`、`errors=[]`。
 
-这里的 `prepared` 只表示 input split、相机元数据、GT、provenance 和 manifest 已完整落盘，不表示已经为该单元运行 GenRecon。52 个 prepared 单元中已有 26 个 prediction/result，另 26 个仍为 `missing-prediction`；24 个 OmniObject3D 槽位保持 `blocked-auth`。四个新增结果只读取各单元的 8 张 conditioning RGB、unit manifest 和 conditioning camera records，不读取 heldout RGB/depth、conditioning depth 或 reference geometry，也不使用 GT ICP。
+这里的 `prepared` 只表示 input split、相机元数据、GT、provenance 和 manifest 已完整落盘，不表示已经为该单元运行 GenRecon。76 个 prepared 单元中已有 26 个 prediction/result，另 50 个为 `missing-prediction`。四个新增结果只读取各单元的 8 张 conditioning RGB、unit manifest 和 conditioning camera records，不读取 heldout RGB/depth、conditioning depth 或 reference geometry，也不使用 GT ICP。
 
 ## 2. 冻结范围与状态
 
@@ -23,8 +22,8 @@
 | 7-Scenes | G1 fusion reference | scene | 7 | 7 | 1 | `chess` 已计分，6 个待重建 |
 | Redwood reconstruction | G2 synthetic exact | scene | 2 | 2 | 1 | `livingroom` 已计分，1 个待重建 |
 | DTU MVS | O0 instance scan | instance | 15 | 15 | 1 | `scan24` 已计分，14 个待重建 |
-| OmniObject3D | O0 instance scan | instance | 24 | 0 | 0 | OpenXLab 登录与 AK/SK 阻塞 |
-| **总计** | | | **76** | **52** | **26** | **24 个声明式 blocker；26 个 prepared 单元待 prediction** |
+| OmniObject3D | O0 instance scan | instance | 24 | 24 | 0 | adapter v3 packages 完整，24 个待重建 |
+| **总计** | | | **76** | **76** | **26** | **50 个 prepared 单元待 prediction；无 source blocker** |
 
 冻结协议位于 `configs/eval/gt_calibration_v1.json`。汇总同时按 protocol signature、GT provenance tier、scene/instance unit track 和 prediction-generation track 分离，禁止直接求一个跨层级或跨协议总均值。
 
@@ -115,9 +114,23 @@ reference 的流式 polygon crop 另以 Open3D 官方 `SelectionPolygonVolume` �
 
 该单元现已有 registry-backed representative prediction，并按 `official-crop-global-reference` scope 完成计分。相机与 GT 的关系来自官方 alignment，属于 `GT-pose-official-alignment` unit track；prediction 则属于 `GT-pose-foundation-pseudo-geometry` generation track，不是 estimated-pose 或端到端 Any-Video-to-Mesh 结果。8 个 heldout views 未参与 GenRecon conditioning，但全部 371 帧参与过共享内参恢复，因此也不是 intrinsics-independent heldout。该 scope 始终单独汇总，不能与 `raw-global` 表混报。
 
-### 3.7 OmniObject3D 24 请求槽位
+### 3.7 OmniObject3D 24 official-object units
 
-官方 OpenXLab 需要登录和 AK/SK；本机没有授权凭据，也未绕过认证。24 个条目均为 `blocked-auth`。当前 object 名称是冻结的语义请求槽位，未授权前不宣称它们已经映射到官方 object IDs。
+OpenXLab 认证与 metadata blocker 已解除。凭据只保存在本机用户配置，不进入仓库、项目环境或日志。先获取 1,497-file metadata index（总索引 1,531,408,658,770 bytes），再只下载冻结 12 类所需资产；没有执行约 1.39 TiB 的全量下载。
+
+Adapter v3 固定使用官方 `/raw/blender_renders/<category>.tar.gz` 100-view reconstruction track 与 `/raw/raw_scans/<category>.tar.gz` professional scans。旧 24-view GET3D track 不用于 scan calibration。24 个 official object IDs 覆盖 12 类各 2 个；`vase_002` 因官方 full-render/raw-scan pair 在 `r_0` 上只有 0.581420 visibility-aware mask IoU 而被拒绝，冻结替代为 `vase_004`，失败证据保留在 plan 的 `rejected_candidates`。
+
+每个单元落盘：
+
+- 100 张 RGB、100 张 normal、100 张 depth EXR 和一份 transforms 的 source-completeness audit；
+- 从 100 个 official cameras 以 camera-center FPS 冻结 8 conditioning + 8 disjoint heldout；
+- 用 `depth < 65504.0` 得到前景 mask，将 source RGB 合成到白底；depth 数值和 normal 均不作为 GenRecon conditioning，也不导出 depth；
+- raw OBJ 先乘审计后的 per-object scale，再右乘 Blender OBJ import axis；reference 写为 `normalized-object` PLY；
+- 只允许 bbox-diagonal 0.5%/1%/2% 阈值，禁止报告米制 Chamfer 或 2/5/10 cm 分数。
+
+24 x 100 个独立 scan/render alignment views 全部通过：2,399 个 fast projected-vertex checks，`book_001` 的 1 个 view 通过 visibility-aware raycast fallback；`teapot_002` 有 1 个有界 nearest-SO(3) repair；`table_001`、`table_002` 的记录 scale 明显违反发布 renderer target，因此严格按官方 `0.99/raw_max_abs` 公式恢复。Fast gate 固定为最大 bbox 边误差 8 px、最小 bbox IoU 0.94；fallback full-mask IoU 至少 0.95。所有例外均写入 unit audit，没有放宽阈值。
+
+这些 RGB 和 reference scan 来自同一对象的 scan-derived render domain，因此 8 heldout RGB 不是 geometry-independent evidence。Reference scan 只用于评测和可视化，绝不能作为 GenRecon conditioning。
 
 ## 4. 数据完整性验证
 
@@ -126,33 +139,35 @@ reference 的流式 polygon crop 另以 Open3D 官方 `SelectionPolygonVolume` �
 | 检查项 | 结果 |
 |---|---:|
 | Registry units | 76 |
-| Prepared / blocked-auth | 52 / 24 |
-| Conditioning / heldout RGB（prepared） | 415 / 415 |
-| 成功解码 RGB | 830 |
+| Prepared / blocked | 76 / 0 |
+| Conditioning / heldout RGB（prepared） | 607 / 607 |
+| 成功解码 RGB | 1,214 |
 | 成功解码 depth | 464 |
-| Reference files | 58 |
-| Reference vertices | 339,797,392 |
-| Reference faces | 78,818,470 |
-| Reference bytes | 5,513,357,265 |
-| Source records | 846 |
+| Omni adapter-v3 package contracts | 24 |
+| Reference files | 82 |
+| Reference vertices | 351,284,071 |
+| Reference faces | 101,807,332 |
+| Reference bytes | 5,950,057,924 |
+| Source records | 918 |
 | Existing prediction meshes / bytes | 26 / 12,059,314,964 |
-| Strict JSON files | 147 |
+| Strict JSON files | 197 |
 | 结果 | `pass` |
 
-`source_hash_bytes=148,241,226,710` 是 manifest 对 source records 的逻辑引用总量，DTU 等共享 archive 会被多个 unit 引用，不能解释为物理磁盘占用。validator 在同一进程内按路径、size、mtime 去重 SHA256 读取。
+`source_hash_bytes=216,842,849,236` 是 manifest 对 source records 的逻辑引用总量，DTU 和 Omni category archives 等共享源会被多个 unit 引用，不能解释为物理磁盘占用。validator 在同一进程内按路径、size、mtime 去重 SHA256 读取。
 
-`data/gt-calibration-v1/source_validation.json` 对 33 个 archives/videos、39,113,567,386 bytes 完成深验证：
+`data/gt-calibration-v1/source_validation.json` 对 71 个 archives/videos、80,772,051,894 bytes 完成深验证：
 
 - 22 ZIP：全 archive CRC；
 - 10 7z：全 archive CRC；
 - 1 MP4：metadata 和首/中/尾有效帧解码；
-- T&T 视频/图像 ZIP 官方 MD5 对照；
-- T&T 11 个 binary PLY、12 条 scanner positions、alignment Sim(3) 和 fixed-pose intrinsics artifact；
+- 38 TAR/GZip：流式完整读取、path safety、无 link/device member、无重复 file member，并逐个绑定 OpenXLab metadata size/SHA256；
+- 12 个 selected full-render archives 与 12 个 selected raw-scan archives；24 个 object 各自恰好 100 RGB、100 normal、100 depth、1 transforms 和 1 个非空 `Scan.obj`；
+- T&T 视频/图像 ZIP 官方 MD5 对照，以及 11 个 binary PLY、12 条 scanner positions、alignment Sim(3) 和 fixed-pose intrinsics artifact；
 - 旧 quota HTML 仅作为 1 条 `historical-resolved-download-failure`，当前 declared quota blocker 为 0。
 
 结果为 `pass`，`errors=[]`。
 
-同一 source tree 上连续执行两次 T&T 数值 calibration，规范化 source references 前的 `Meetingroom_intrinsics.json` SHA256 均为 `03442a739028e99ee134dfd1b1bd7d252abedd8e01c94f99a85760cb78554693`；最终可移植 artifact SHA256 为 `efa8dcdc70f81361c8ff5b17384d63fc157fa7d523429674cf1f067d183c72b0`。随后连续两次强制构建的生成 JSON/CSV 逐文件 SHA256 diff 为零。最终 registry SHA256 为 `9d5592a913463ce23c38e638d48558f23f9d41600696ccad9ea6ef1bf6fc6cc0`，validation SHA256 为 `cba08ac09e94ffa6abe47d01f0f79397c7f63af6f43d04acc27a29878ee96d0c`，source-validation SHA256 为 `2a9172827fd2c5a8298760e02ae4eb6f0581ed869b3c08faca87132f086234ca`，evaluation index SHA256 为 `85fb5bb17410039f2c106d74f30735abbe71ce0799158b961cc3325da1a69e33`。构建 manifest 不写墙钟时间，因此同输入不会仅因运行时间不同而产生 provenance 漂移。
+同一 source tree 上连续执行两次 T&T 数值 calibration，规范化 source references 前的 `Meetingroom_intrinsics.json` SHA256 均为 `03442a739028e99ee134dfd1b1bd7d252abedd8e01c94f99a85760cb78554693`；最终可移植 artifact SHA256 为 `efa8dcdc70f81361c8ff5b17384d63fc157fa7d523429674cf1f067d183c72b0`。Omni adapter-v3 authoritative build 后 registry/summary/validation 均使用无墙钟 deterministic JSON/CSV。当前关键 SHA256：plan `aac90c2147d4e6d05c6a7dc86200b50a313749c47cf6d7e0e6847863b99f0ff3`，registry `75e7f7e19dd8d305625ab9375d95a3c4ef70c36c652ed86849a9fba503079017`，summary CSV `8ed1a1f5d261b1fe41892c6ee1a1ff6793d6b14e0aa6a093403b827740bbbea3`，validation `f7dc07b989eb94b7303569d43c5b1cfcf3996c04d9677db933c318c059aabadd`，source-validation `d47c926c5f80a6ce665c7dafa495c6380711425c5da89246b855199316860a12`，evaluation index `81ba603bd41af7bee95c8b57c2548523a862e965731813f989bc45e595298fb5`。
 
 ## 5. 统一评测协议
 
@@ -238,7 +253,7 @@ ETH3D 的 completeness 明显差于 ScanNet++，说明 full laser reference 中�
 | redwood-livingroom | G2 | raw-global | 0.169891 | 0.392519 | 0.281205 | 0.066537 | 0.192308 | 0.335949 | `null` |
 | dtu-scan24 | O0 | raw-global | 0.051826 | 0.047409 | 0.049617 | 0.174609 | 0.553768 | 0.935098 | `null` |
 
-这四行不能彼此求总均值，也不能并入 legacy G0 表：T&T 使用不同 scope；四者 GT tier 不同；legacy 22 项的 prediction provenance 未被历史 artifact 完整记录，而新增四项有完整 RGB-only foundation input contract。evaluation index 顶层因此固定为 `aggregate_policy=no-cross-protocol-aggregation`，包含 25 个 `raw-global` results 和 1 个 T&T `official-crop-global-reference` result。
+这四行不能彼此求总均值，也不能并入 legacy G0 表：T&T 使用不同 scope；四者 GT tier 不同；legacy 22 项的 prediction provenance 未被历史 artifact 完整记录，而新增四项有完整 RGB-only foundation input contract。evaluation index 顶层因此固定为 `aggregate_policy=no-cross-protocol-aggregation`，包含 25 个 `raw-global` results 和 1 个 T&T `official-crop-global-reference` result；其余 50 个 prepared units 全部以 `missing-prediction` skip 明示，其中 24 个是 OmniObject3D。
 
 DTU `scan24` 的 F@10 cm 为 0.935098，但同相机 prediction render 明确出现大面积绿色/白色背景平面，并遮挡建筑主体。这是实际 hallucination，不能由高阈值 F-score、非黑 coverage 或 technical validator 的 `pass` 覆盖。
 
@@ -248,8 +263,8 @@ DTU `scan24` 的 F@10 cm 为 0.935098，但同相机 prediction render 明确出
 
 - `configs/eval/gt_calibration_v1.json`：76-unit 冻结计划、GT 分层、阈值、聚合和 checksum policy。
 - `tools/calibrate_tnt_meetingroom.py`：全部 371 帧顺序 SIFT、官方 poses 固定的共享 radial intrinsics calibration 和质量 gate。
-- `tools/prepare_gt_calibration_datasets.py`：多数据集 adapter、split、T&T Sim(3)/undistortion/official-crop reference、registry、source SHA256 和 payload validator。
-- `tools/validate_gt_calibration_sources.py`：ZIP/7z CRC、视频采样解码、官方 MD5、T&T scans/alignment/calibration 和历史 quota 响应审计。
+- `tools/prepare_gt_calibration_datasets.py`：多数据集 adapter、split、T&T Sim(3)/undistortion/official-crop reference、Omni adapter v3 的 safe TAR/EXR mask/100-view alignment/normalized-object package、registry、source SHA256 和 payload validator。
+- `tools/validate_gt_calibration_sources.py`：ZIP/7z CRC、TAR/GZip stream/path safety、OpenXLab metadata size/SHA binding、selected 100-view render/raw-scan payload contracts、视频采样解码、官方 MD5、T&T scans/alignment/calibration 和历史 quota 响应审计。
 - `tools/evaluate_gt_suite.py`：mesh/point-cloud 统一 canonical schema、按 protocol/tier/dataset/unit track/prediction track 聚合、bootstrap CI，以及 stale registry/result 拒绝。
 - `tools/evaluate_mesh.py`：2/5/10 cm、distance quantiles、bbox-normalized thresholds 和严格 JSON。
 - `tools/evaluate_mesh_pointcloud.py`：同一多阈值 schema，并显式区分 legacy prediction-AABB 与 full-reference scope。
@@ -257,30 +272,32 @@ DTU `scan24` 的 F@10 cm 为 0.935098，但同相机 prediction render 明确出
 - `tools/prepare_gt_representative_genrecon.py`：conditioning-only source audit、VGGT pseudo geometry、conditioning-camera Sim(3)、metric z-up、input-contract SHA、official-frame PLY/PBR GLB package 和专用 validator。
 - `tools/run_foundation_genrecon_batch.py`：复用现有 resumable GenRecon/PBR runner；本轮 40/40 chunks 非空、0 fallback。
 - `tools/export_gt_calibration_videos.py`：固定代表场景、冻结 8+8 相机、RGB/reference/prediction 三栏 H.264 和 HTML 审查页。
-- `tools/validate_gt_calibration_videos.py`：逐帧、geometry provenance、SHA256、视频完整解码和 blocker 边界的独立 release validator。
+- `tools/validate_gt_calibration_videos.py`：逐帧、geometry provenance、SHA256、视频完整解码、missing-prediction/source-blocker 边界和按候选状态推导全局计数的独立 release validator。
 
 每个 `evaluation.json` 包含 prediction/reference/manifest SHA256、GT kind、alignment、ROI、scope、sampling、阈值、canonical metrics、backend 原始结果和 limitations。`summarize` 会核对当前 registry membership、unit manifest 路径、prediction path/SHA、GT tier、protocol 和 prediction track；registry 撤销、换路径、换 manifest 或换 generation track 时直接拒绝 stale result，不会静默复用旧指标。
 
 验证结果：
 
-- 全仓库：`227 passed in 8.70s`；
+- 全仓测试：`239 passed in 7.43s`；
 - 新增/修改 Python 文件全部通过 `py_compile`；
-- `configs/eval/gt_calibration_v1.json` 通过严格 JSON 解析；
+- `configs/eval/gt_calibration_v1.json` 和所有生成 JSON 通过严格 JSON 解析；
 - `git diff --check` 无输出；
-- 完整 `prepare ... all`、深 source validation 和 evaluation summarize 均实际执行成功；
+- authoritative Omni adapter-v3 build、GT deep validation、71-file source validation、evaluation summarize、视频内部/独立 release validation 均实际执行成功；
+- 第二次 `all --force` replay 在 19:51.50 完成并再次得到 76/76 prepared；170 个 builder-owned unit JSON/CSV 与 registry/summary/validation 的 pre/post SHA256 manifests 逐行相同；
 - 最终无残留 builder/evaluator/pytest/GenRecon 进程。
 
 ## 8. 未完成项与禁止声明
 
-1. OmniObject3D 仍缺官方授权，24 个语义请求槽位不能称为已下载对象。
-2. 剩余 ETH3D 5、7-Scenes 6、Redwood 1、DTU 14，共 26 个 prepared 单元仍无 GenRecon prediction。
-3. T&T、7-Scenes、Redwood 和 DTU 新结果属于 `GT-pose-foundation-pseudo-geometry`，不是 estimated-pose 端到端 Any-Video-to-Mesh，也不是完全独立 geometry heldout。
-4. 7-Scenes、Redwood、DTU 不是 G0 room-scale independent laser table；T&T 还使用独立 official-crop scope，禁止直接求总均值。
-5. ScanNet++ 可能参与过 GenRecon 训练，只能作 calibration，不证明 strict zero-shot。
-6. VGGT-1B checkpoint 为 `CC-BY-NC-4.0`，本轮 foundation inference 仅限非商业研究用途；pseudo geometry 的内部一致性不是独立真实精度证据。
-7. DTU `scan24` prediction 存在大面积绿色/白色背景平面 hallucination；高 F@10 cm 不能覆盖该视觉失败。
-8. 当前 v1 已统一核心 3D geometry schema；observed/unobserved visibility、heldout full-GT-mask RGB/depth、chunk boundary 和 camera trajectory 仍需对应 adapter 后单列，不能用空值伪装成已评测。
-9. 6 个可用代表均已有真实 registry-backed prediction render；`GT / REFERENCE GEOMETRY` 栏仍只用于评测和可视化，绝不能称为模型输出或 conditioning 输入。
+1. 全部 76 个数据单元已 prepared，但仍有 50 个没有 GenRecon prediction：ETH3D 5、7-Scenes 6、Redwood 1、DTU 14、OmniObject3D 24。
+2. OmniObject3D 是 `normalized-object`、scan-derived 100-view domain，只允许 bbox-diagonal normalized thresholds；禁止报告米制 Chamfer/2/5/10 cm，也禁止与 DTU 的 meter protocol 合并。
+3. Omni 的 conditioning/heldout RGB 与 reference scan 来自同一对象；heldout 不属于 geometry-independent evidence，reference 也不得作为 GenRecon conditioning 或 GT ICP。
+4. T&T、7-Scenes、Redwood 和 DTU 新结果属于 `GT-pose-foundation-pseudo-geometry`，不是 estimated-pose 端到端 Any-Video-to-Mesh，也不是完全独立 geometry heldout。
+5. 7-Scenes、Redwood、DTU 不是 G0 room-scale independent laser table；T&T 还使用独立 official-crop scope，禁止直接求总均值。
+6. ScanNet++ 可能参与过 GenRecon 训练，只能作 calibration，不证明 strict zero-shot。
+7. VGGT-1B checkpoint 为 `CC-BY-NC-4.0`，本轮 foundation inference 仅限非商业研究用途；pseudo geometry 的内部一致性不是独立真实精度证据。
+8. DTU `scan24` prediction 存在大面积绿色/白色背景平面 hallucination；高 F@10 cm 不能覆盖该视觉失败。
+9. 当前 v1 已统一核心 3D geometry schema；observed/unobserved visibility、heldout full-GT-mask RGB/depth、chunk boundary 和 camera trajectory 仍需对应 adapter 后单列，不能用空值伪装成已评测。
+10. 视频中 6 个代表有真实 registry-backed prediction；Omni 代表只显示 real RGB/reference 和显式 `missing-prediction` card。`GT / REFERENCE GEOMETRY` 栏绝不能称为模型输出或 conditioning 输入。
 
 ## 9. 复现入口
 

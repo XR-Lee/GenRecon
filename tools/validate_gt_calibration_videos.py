@@ -69,6 +69,22 @@ def expected_role_order() -> list[tuple[str, int]]:
     ]
 
 
+def expected_release_frame_counts(available: int, blocked: int) -> dict[str, int]:
+    available_contract = expected_video_contract(AVAILABLE_STATUS)
+    blocked_contract = expected_video_contract(BLOCKED_STATUS)
+    return {
+        "camera_frames": available * len(expected_role_order()),
+        "decoded_candidate_video_frames": (
+            available * sum(spec[0] for spec in available_contract.values())
+            + blocked * sum(spec[0] for spec in blocked_contract.values())
+        ),
+        "overview_video_frames": (
+            available * available_contract["comparison"][0]
+            + blocked * blocked_contract["status"][0]
+        ),
+    }
+
+
 def _check_file_hash(
     path: Path,
     expected_hash: str | None,
@@ -298,11 +314,20 @@ def write_dataset_contact(
     draw.rectangle((x, y, 1920, 1440), fill=(25, 30, 33))
     draw.rectangle((x, y, x + 12, 1440), fill=(31, 147, 156))
     draw.text((x + 46, y + 50), "RELEASE CONTACT", font=_font(27, bold=True), fill=(246, 248, 248))
+    available = sum(document.get("status") == AVAILABLE_STATUS for document in candidates)
+    blocked = sum(document.get("status") == BLOCKED_STATUS for document in candidates)
+    prediction_available = sum(
+        document.get("prediction_status") == AVAILABLE_STATUS for document in candidates
+    )
+    prediction_missing = sum(
+        document.get("prediction_status") == MISSING_PREDICTION_STATUS
+        for document in candidates
+    )
     lines = [
-        "7 dataset statuses",
-        "6 source + reference representatives",
-        "2 representatives with GenRecon prediction",
-        "1 authorization blocker, no fabricated assets",
+        f"{len(candidates)} dataset representatives",
+        f"{available} prepared source + reference representatives",
+        f"{prediction_available} representatives with GenRecon prediction",
+        f"{prediction_missing} missing prediction; {blocked} source blockers",
         "Frozen 8 conditioning + 8 heldout cameras",
     ]
     for line_index, line in enumerate(lines):
@@ -412,7 +437,8 @@ def validate_release(output: Path) -> dict[str, Any]:
         reference_coverages.extend(detail["reference_coverages"])
         prediction_coverages.extend(detail["prediction_coverages"])
 
-    expected_overview_frames = available * 16 + blocked * 8
+    expected_frame_counts = expected_release_frame_counts(available, blocked)
+    expected_overview_frames = expected_frame_counts["overview_video_frames"]
     overview = index.get("overview_video", {})
     actual_overview = _validate_video(
         overview,
@@ -436,12 +462,19 @@ def validate_release(output: Path) -> dict[str, Any]:
     for key, expected_value in expected_counts.items():
         if counts.get(key) != expected_value:
             errors.append(f"index count {key} {counts.get(key)} != {expected_value}")
-    if totals["camera_frames"] != 96:
-        errors.append(f"expected 96 frozen camera frames, found {totals['camera_frames']}")
-    if totals["decoded_candidate_video_frames"] != 392:
+    if totals["camera_frames"] != expected_frame_counts["camera_frames"]:
         errors.append(
-            "expected 392 decoded candidate video frames, found "
-            f"{totals['decoded_candidate_video_frames']}"
+            f"expected {expected_frame_counts['camera_frames']} frozen camera frames, "
+            f"found {totals['camera_frames']}"
+        )
+    if (
+        totals["decoded_candidate_video_frames"]
+        != expected_frame_counts["decoded_candidate_video_frames"]
+    ):
+        errors.append(
+            "expected "
+            f"{expected_frame_counts['decoded_candidate_video_frames']} decoded candidate "
+            f"video frames, found {totals['decoded_candidate_video_frames']}"
         )
     if not reference_coverages or min(reference_coverages) <= 0.0001:
         errors.append("reference coverage audit is empty")
